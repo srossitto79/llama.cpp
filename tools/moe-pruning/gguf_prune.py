@@ -43,13 +43,20 @@ from gguf import GGUFReader, GGUFWriter, GGMLQuantizationType, GGUFValueType
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-# Suffixes of tensors that carry the expert dimension (last axis in ggml layout)
-EXPERT_SUFFIXES = {
+# Base tensor names that carry the expert dimension (last axis in ggml layout).
+# Some GGUFs append parameter tails like ".weight" / ".bias".
+EXPERT_BASE_SUFFIXES = {
     "ffn_up_exps",
     "ffn_down_exps",
     "ffn_gate_inp",
-    "ffn_exp_probs_b",
 }
+
+
+def is_expert_suffix(suffix: str) -> bool:
+    """Return True if a tensor suffix is one of the MoE expert tensors to prune."""
+    if suffix in ("ffn_exp_probs_b", "exp_probs_b", "exp_probs_b.bias"):
+        return True
+    return any(suffix == base or suffix.startswith(base + ".") for base in EXPERT_BASE_SUFFIXES)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -124,15 +131,17 @@ def copy_field(writer: GGUFWriter, field, reader: GGUFReader) -> bool:
     elif val_type == GGUFValueType.ARRAY:
         elem_type = field.types[1]
         if elem_type == GGUFValueType.STRING:
-            # parts layout: [arr_type, count, str_len_0, str_data_0, …]
-            vals = [bytes(p) for p in field.parts[3::2]]
+            # ReaderField.data stores indices of ARRAY payload items; for
+            # STRING arrays this points at each string byte payload.
+            vals = [bytes(field.parts[idx]) for idx in field.data]
             writer.add_key_value(key, vals, GGUFValueType.ARRAY, sub_type=GGUFValueType.STRING)
         else:
-            np_type = reader.gguf_scalar_to_np.get(elem_type)
-            if np_type is None:
-                print(f"  WARNING: skipping array field {key!r} (unsupported elem type {elem_type})")
+            # ReaderField.data stores part-indices, not payload values.
+            vals = field.contents()
+            if not isinstance(vals, list):
+                print(f"  WARNING: skipping array field {key!r} (unexpected non-list contents)")
                 return False
-            writer.add_array(key, np.array(field.data, dtype=np_type).tolist())
+            writer.add_array(key, vals)
     else:
         print(f"  WARNING: skipping field {key!r} (unsupported type {val_type})")
         return False
@@ -178,7 +187,7 @@ def main():
     kept: dict[int, list[int]] = {}
     for tensor in reader.tensors:
         il, suffix = layer_and_suffix(tensor.name)
-        if il is None or suffix not in EXPERT_SUFFIXES:
+        if il is None or not is_expert_suffix(suffix):
             continue
         if il in kept:
             continue  # already computed for this layer
@@ -197,6 +206,10 @@ def main():
 
     # --- metadata: copy all fields, replace expert_count ---
     for field in reader.fields.values():
+        # Reader exposes synthetic header fields (GGUF.*) that are not KV
+        # metadata and must not be copied back as normal keys.
+        if field.name.startswith("GGUF."):
+            continue
         # Writer already sets general.architecture from ctor; avoid duplicate warning.
         if field.name in (expert_count_key, "general.architecture"):
             continue  # replaced below
@@ -209,7 +222,7 @@ def main():
     n_pruned = 0
     for tensor in reader.tensors:
         il, suffix = layer_and_suffix(tensor.name)
-        is_expert = il is not None and suffix in EXPERT_SUFFIXES
+        is_expert = il is not None and is_expert_suffix(suffix)
 
         if is_expert:
             k = kept[il]

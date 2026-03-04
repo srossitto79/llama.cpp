@@ -6,15 +6,13 @@
 set -e
 
 WORKSPACE=~
-PYTHON=python3
+PYTHON=python
 
 echo "=== Nemotron REAP Expert Pruning ==="
 echo "Keep ratio: 0.5 (64/128 experts per MoE layer)"
 echo "Stats file: $WORKSPACE/expert_stats_reap.json"
 echo "Output file: $WORKSPACE/nemotron-3-trader-15b-Q4_K_M.gguf"
 echo ""
-
-cd "$WORKSPACE"
 
 "$PYTHON" gguf_prune.py \
     --input ~/nemotron-3-nano-30b-Q4_K_M.gguf \
