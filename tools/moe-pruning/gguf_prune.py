@@ -80,13 +80,14 @@ def pick_experts(layer_stats: dict, keep_n: int) -> list[int]:
 
 def slice_expert_axis(data: np.ndarray, keep: list[int]) -> np.ndarray:
     """
-    Slice the last axis of `data` keeping only `keep` indices.
+    Slice the expert axis of reader tensor data keeping only `keep` indices.
 
-    Works for both float (F16/F32) and quantised (uint8 raw bytes) tensors
-    because in ggml each expert occupies a contiguous, independently-quantised
-    block along the last axis.
+    GGUFReader reshapes tensors to NumPy with reversed ggml dims, so for MoE
+    tensors where experts are the last ggml dim, expert is axis 0 in `data`.
+    This also preserves quantized row-byte alignment (axis -1 is byte-packed
+    rows for quantized tensors and must not be sliced for expert pruning).
     """
-    return np.take(data, keep, axis=-1)
+    return np.take(data, keep, axis=0)
 
 
 def copy_field(writer: GGUFWriter, field, reader: GGUFReader) -> bool:
@@ -96,7 +97,8 @@ def copy_field(writer: GGUFWriter, field, reader: GGUFReader) -> bool:
     part = field.parts[-1]
 
     if val_type == GGUFValueType.STRING:
-        writer.add_string(key, str(bytes(part), "utf-8"))
+        # Preserve raw bytes: GGUF metadata can contain non-UTF8 strings.
+        writer.add_key_value(key, bytes(part), GGUFValueType.STRING)
     elif val_type == GGUFValueType.UINT8:
         writer.add_uint8(key, int(part[0]))
     elif val_type == GGUFValueType.INT8:
@@ -123,8 +125,8 @@ def copy_field(writer: GGUFWriter, field, reader: GGUFReader) -> bool:
         elem_type = field.types[1]
         if elem_type == GGUFValueType.STRING:
             # parts layout: [arr_type, count, str_len_0, str_data_0, …]
-            vals = [str(bytes(p), "utf-8") for p in field.parts[3::2]]
-            writer.add_array(key, vals)
+            vals = [bytes(p) for p in field.parts[3::2]]
+            writer.add_key_value(key, vals, GGUFValueType.ARRAY, sub_type=GGUFValueType.STRING)
         else:
             np_type = reader.gguf_scalar_to_np.get(elem_type)
             if np_type is None:
@@ -195,7 +197,8 @@ def main():
 
     # --- metadata: copy all fields, replace expert_count ---
     for field in reader.fields.values():
-        if field.name == expert_count_key:
+        # Writer already sets general.architecture from ctor; avoid duplicate warning.
+        if field.name in (expert_count_key, "general.architecture"):
             continue  # replaced below
         copy_field(writer, field, reader)
 
@@ -211,14 +214,9 @@ def main():
         if is_expert:
             k = kept[il]
             data = slice_expert_axis(tensor.data, k)
-            # raw_shape must reflect the new expert count; ggml shape is in
-            # column-major order (innermost first), so last element is n_experts
-            new_shape = list(tensor.shape)
-            new_shape[-1] = len(k)
             writer.add_tensor(
                 tensor.name,
                 data,
-                raw_shape=new_shape,
                 raw_dtype=tensor.tensor_type,
             )
             n_pruned += 1
@@ -226,7 +224,6 @@ def main():
             writer.add_tensor(
                 tensor.name,
                 tensor.data,
-                raw_shape=list(tensor.shape),
                 raw_dtype=tensor.tensor_type,
             )
 
