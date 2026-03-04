@@ -25,6 +25,10 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+// Internal adapter struct — included directly to avoid the temp-GGUF roundtrip
+// for wiring trainable LoRA tensors into the compute graph.
+#include "../../src/llama-adapter.h"
+
 #define JSON_ASSERT GGML_ASSERT
 #include <nlohmann/json.hpp>
 
@@ -253,7 +257,7 @@ static lora_tensors alloc_lora_tensors(
 
     for (ggml_tensor * t = ggml_get_first_tensor(ctx_meta);
          t; t = ggml_get_next_tensor(ctx_meta, t)) {
-        if (t->n_dims < 2) continue;
+        if (ggml_n_dims(t) < 2) continue;
         if (!tensor_matches_targets(t->name, targets)) continue;
         matched.push_back({t->name, t->ne[0], t->ne[1]});
     }
@@ -473,45 +477,31 @@ int main(int argc, char ** argv) {
     auto lt = alloc_lora_tensors(params.model.path, targets, params.lora_rank, rng);
     if (lt.ab.empty()) return 1;
 
-    // Inject LoRA adapter into context so build_lora_mm picks it up
-    // We build a transient llama_adapter_lora and register it on the context.
-    // The tensors are owned by lt.ctx / lt.buf — they stay alive for training.
+    // Build a llama_adapter_lora directly from our lt.ab tensors and activate it
+    // on the context so that build_lora_mm injects the LoRA deltas at graph build
+    // time inside llama_opt_init.  The adapter struct is populated manually from
+    // the internal header (src/llama-adapter.h) to avoid a temp-file round-trip.
+    //
+    // Ownership: lt.ctx/lt.buf own the tensor memory; the adapter just holds
+    // pointers.  All objects outlive training.
+    llama_adapter_lora lora_adapter;
+    lora_adapter.alpha = lora_alpha;
+
+    for (auto & kv : lt.ab) {
+        llama_adapter_lora_weight lw(kv.second.first, kv.second.second);
+        lora_adapter.ab_map[kv.first] = lw;
+
+        // Mark A/B as trainable BEFORE llama_opt_init builds the graph.
+        // llama_set_param (in opt_init) won't find these because they are not
+        // in model->layers — we mark them directly here instead.
+        ggml_set_param(kv.second.first);   // lora_a
+        ggml_set_param(kv.second.second);  // lora_b
+    }
+
     {
-        // Register each LoRA A/B pair as trainable parameters directly.
-        // We call ggml_set_param here because llama_set_param inside opt_init
-        // only sees the base model layers; our tensors are in a separate context.
-        for (auto & kv : lt.ab) {
-            ggml_set_param(kv.second.first);   // lora_a → trainable
-            // lora_b is initialized to zero; mark trainable too
-            ggml_set_param(kv.second.second);  // lora_b → trainable
-        }
-
-        // Build a temporary llama_adapter_lora from our tensors and apply to ctx
-        // so that build_lora_mm injects the LoRA deltas into the compute graph.
-        //
-        // llama_adapter_lora is a private struct — we use the public init API
-        // which loads from a GGUF file.  Instead we exploit that the adapter is
-        // looked up by base weight pointer inside build_lora_mm:
-        //   lora.first->get_weight(w)  →  finds by base-tensor pointer key
-        //
-        // We cannot call get_weight because it is on the internal struct.
-        // Therefore we pre-save a temp GGUF, load it back, and apply it.
-        // This is the safest path that does NOT require changes to private API.
-
-        const std::string tmp_path = params.lora_out + ".tmp_train.gguf";
-        save_adapter(lt, tmp_path, arch, lora_alpha);
-
-        struct llama_adapter_lora * adapter = llama_adapter_lora_init(model, tmp_path.c_str());
-        if (!adapter) {
-            LOG_ERR("%s: failed to init LoRA adapter from temp file\n", __func__);
-            return 1;
-        }
-
+        struct llama_adapter_lora * ap = &lora_adapter;
         float scale = 1.0f;
-        llama_set_adapters_lora(ctx, &adapter, 1, &scale);
-
-        // The temp file is no longer needed; clean up asynchronously after training.
-        // (We leave it for now; it gets overwritten by the final save.)
+        llama_set_adapters_lora(ctx, &ap, 1, &scale);
     }
 
     // Initialize optimizer — our custom param filter restricts training to lora_a/b
@@ -545,14 +535,8 @@ int main(int argc, char ** argv) {
     ggml_opt_result_free(result_train);
     ggml_opt_result_free(result_eval);
 
-    // Save final adapter (overwrites temp file if same path)
+    // Save final trained adapter
     save_adapter(lt, params.lora_out, arch, lora_alpha);
-
-    // Clean up temp init file if it differs
-    const std::string tmp_path = params.lora_out + ".tmp_train.gguf";
-    if (tmp_path != params.lora_out) {
-        std::remove(tmp_path.c_str());
-    }
 
     ggml_backend_buffer_free(lt.buf);
     ggml_free(lt.ctx);
