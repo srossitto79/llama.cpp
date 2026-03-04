@@ -3592,6 +3592,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    // qlora flags
+    add_opt(common_arg(
+        {"--lora-rank"}, "N",
+        string_format("LoRA rank r (default: %d)", params.lora_rank),
+        [](common_params & params, int value) { params.lora_rank = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    add_opt(common_arg(
+        {"--lora-alpha"}, "F",
+        string_format("LoRA alpha (default: 0 = use rank value)", (double) params.lora_alpha),
+        [](common_params & params, const std::string & value) { params.lora_alpha = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    add_opt(common_arg(
+        {"--lora-targets"}, "SUBSTRINGS",
+        string_format("comma-separated substrings of tensor names to add LoRA to (default: %s)", params.lora_targets.c_str()),
+        [](common_params & params, const std::string & value) { params.lora_targets = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    add_opt(common_arg(
+        {"--lora-out"}, "FNAME",
+        string_format("output LoRA adapter GGUF path (default: %s)", params.lora_out.c_str()),
+        [](common_params & params, const std::string & value) { params.lora_out = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    add_opt(common_arg(
+        {"--train-file"}, "FNAME",
+        "JSONL training dataset (fields: messages|prompt+response|text)",
+        [](common_params & params, const std::string & value) { params.train_file = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
         {"--save-logits"},
         string_format("save final logits to files for verification (default: %s)", params.save_logits ? "true" : "false"),

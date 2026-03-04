@@ -103,6 +103,7 @@ enum llama_example {
     LLAMA_EXAMPLE_TTS,
     LLAMA_EXAMPLE_DIFFUSION,
     LLAMA_EXAMPLE_FINETUNE,
+    LLAMA_EXAMPLE_FINETUNE_QLORA,
     LLAMA_EXAMPLE_FIT_PARAMS,
 
     LLAMA_EXAMPLE_COUNT,
@@ -507,6 +508,13 @@ struct common_params {
     struct lr_opt lr;
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
     float val_split = 0.05f; // fraction of the data used for the validation set
+
+    // qlora finetune
+    int32_t     lora_rank      = 16;              // LoRA rank (r)
+    float       lora_alpha     = 0.0f;            // LoRA alpha (0 = use rank value)
+    std::string lora_targets   = "attn_q,attn_k,attn_v,attn_v_b,attn_out"; // comma-separated substrings to match trainable tensors
+    std::string lora_out       = "adapter.gguf";  // output adapter GGUF path
+    std::string train_file     = "";              // JSONL training dataset path
 
     // embedding
     bool embedding         = false; // get only sentence embedding

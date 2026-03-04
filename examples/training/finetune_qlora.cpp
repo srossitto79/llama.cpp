@@ -428,21 +428,37 @@ int main(int argc, char ** argv) {
     // Parse target substrings
     const auto targets = split_csv(params.lora_targets);
 
-    // Get model architecture string for adapter metadata
-    char arch_buf[256] = {};
-    llama_model_desc(model, arch_buf, sizeof(arch_buf));
-    // architecture is the first word before space/slash
-    std::string arch(arch_buf);
-    arch = arch.substr(0, arch.find_first_of(" /"));
+    // Get model architecture string directly from the GGUF metadata
+    std::string arch;
+    {
+        struct ggml_context * ctx_meta = nullptr;
+        struct gguf_init_params gp = { true, &ctx_meta };
+        struct gguf_context * ctx_gguf = gguf_init_from_file(params.model.path.c_str(), gp);
+        if (ctx_gguf) {
+            int kid = gguf_find_key(ctx_gguf, "general.architecture");
+            if (kid >= 0) arch = gguf_get_val_str(ctx_gguf, kid);
+            gguf_free(ctx_gguf);
+            ggml_free(ctx_meta);
+        }
+    }
+    if (arch.empty()) {
+        // Fall back to model description
+        char arch_buf[256] = {};
+        llama_model_desc(model, arch_buf, sizeof(arch_buf));
+        arch = std::string(arch_buf);
+        arch = arch.substr(0, arch.find_first_of(" /"));
+    }
 
     // Load chat templates (optional — falls back to ChatML if unavailable)
     auto tmpls = common_chat_templates_init(model, "");
 
     // Load JSONL dataset
-    const std::string & data_file = params.prompt_file.empty()
-        ? params.prompt : params.prompt_file;
+    if (params.train_file.empty()) {
+        LOG_ERR("%s: --train-file is required\n", __func__);
+        return 1;
+    }
 
-    auto samples = load_jsonl(data_file, ctx, tmpls.get());
+    auto samples = load_jsonl(params.train_file, ctx, tmpls.get());
     if (samples.empty()) {
         LOG_ERR("%s: no training samples loaded\n", __func__);
         return 1;
