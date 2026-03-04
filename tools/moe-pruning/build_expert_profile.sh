@@ -5,7 +5,7 @@
 
 set -e
 
-LLAMA_SRC="/mnt/w/openclaw_agent/model_pruning_dependencies/llama.cpp"
+LLAMA_SRC="../.."
 BUILD_DIR="$LLAMA_SRC/build_expert"
 
 echo "=== Building llama.cpp + expert-profile tool ==="
@@ -34,9 +34,9 @@ echo "  Binary: $BUILD_DIR/tools/expert-profile/llama-expert-profile"
 echo ""
 echo "=== Usage ==="
 echo "  $BUILD_DIR/tools/expert-profile/llama-expert-profile \\"
-echo "    -m /mnt/f/llm-arena-storage/nemotron-q4.gguf \\"
-echo "    --jsonl /mnt/f/llm-arena-storage/agent_workspace/training-data.jsonl \\"
-echo "    --output /mnt/f/llm-arena-storage/agent_workspace/expert_stats.json \\"
+echo "    -m ~/nemotron-3-nano-30b-Q4_K_M.gguf \\"
+echo "    --jsonl ./training-data.jsonl \\"
+echo "    --output ./expert_stats_reap.json \\"
 echo "    --n-experts 128 \\"
-echo "    --ctx-size 2048 \\"
+echo "    --ctx-size 16384 \\"
 echo "    -ngl 99"

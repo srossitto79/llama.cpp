@@ -5,8 +5,8 @@
 
 set -e
 
-WORKSPACE=/mnt/f/llm-arena-storage/agent_workspace
-PYTHON=/home/sross/.pyenv/versions/3.12.0/bin/python3
+WORKSPACE=~
+PYTHON=python3
 
 echo "=== Nemotron REAP Expert Pruning ==="
 echo "Keep ratio: 0.33 (42/128 experts per MoE layer)"

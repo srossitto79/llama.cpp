@@ -4,13 +4,13 @@
 
 set -e
 
-LLAMA_CPP=/mnt/w/openclaw_agent/model_pruning_dependencies/llama.cpp
-PRUNED_MODEL=/home/sross/nemotron-pruned-0.33
+LLAMA_CPP=../..
+PRUNED_MODEL=~/nemotron-pruned-0.33
 GGUF_F16=$PRUNED_MODEL/model-f16.gguf
 Q4_OUT=$PRUNED_MODEL/model-q4km.gguf
 Q5_OUT=$PRUNED_MODEL/model-q5km.gguf
 
-PYTHON=/home/sross/.pyenv/versions/3.12.0/bin/python3
+PYTHON=python3
 QUANTIZE=$LLAMA_CPP/build/bin/llama-quantize
 
 export LD_LIBRARY_PATH="$LLAMA_CPP/build/bin:$LD_LIBRARY_PATH"
