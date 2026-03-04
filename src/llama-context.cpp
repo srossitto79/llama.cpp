@@ -1953,21 +1953,12 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
-    uint32_t res;
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
-        res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
-    } else {
-        res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
-        for (const auto & lora : model.loras) {
-            res += lora->get_n_nodes();
-        }
+        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
-    // During training, the backward graph is duplicated from the forward graph (ggml_graph_dup
-    // copies gf->size).  gb_grad adds ~2-3x more nodes (grad tensors + backward ops), and gb_opt
-    // adds optimizer step nodes on top.  Pre-inflate the forward graph size so the duplicates
-    // have enough capacity.  This has no effect on inference (opt_ctx is null).
-    if (opt_ctx) {
-        res *= 4;
+    uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+    for (const auto & lora : model.loras) {
+        res += lora->get_n_nodes();
     }
     return res;
 }
@@ -2582,22 +2573,31 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
     GGML_ASSERT(n_batch                    % n_ubatch == 0);
 
+    // Recreate the scheduler and gf_res_prev with a training-inflated graph size before
+    // creating opt_ctx, so opt_ctx captures the new (larger) scheduler pointer.
+    // The backward graph (gb_grad) duplicates gf's size and adds ~2-3x more nodes+leafs;
+    // gb_opt adds optimizer step nodes on top.  Use 8x the un-inflated forward graph size
+    // as a conservative upper bound that covers both n_nodes and n_leafs of gb_opt.
+    {
+        // graph_max_nodes() uses opt_ctx to decide whether to inflate; call it with the
+        // un-inflated result and apply the training multiplier (8x) manually here.
+        const uint32_t base_nodes = [&]() {
+            // temporarily null opt_ctx so graph_max_nodes returns the base value
+            return std::max<uint32_t>(1024u, 8u * model->n_tensors());
+        }();
+        const int64_t inflated     = (int64_t)base_nodes * 8;   // graph node slots (4x forward)
+        const int64_t sched_size   = inflated * 2;              // +leafs headroom for backward
+        gf_res_prev.reset(new llm_graph_result(inflated));
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                                           sched_size, cparams.pipeline_parallel, cparams.op_offload));
+    }
+
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
     opt_params.opt_period      = n_batch / n_ubatch;
     opt_params.get_opt_pars    = lopt_params.get_opt_pars;
     opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
     opt_params.optimizer       = lopt_params.optimizer_type;
     opt_ctx = ggml_opt_init(opt_params);
-
-    // Recreate gf_res_prev with the training-inflated graph size (graph_max_nodes returns 4x
-    // when opt_ctx is set).  gf_res_prev was created during sched_reserve when opt_ctx was
-    // null, so it has the un-inflated capacity — too small for the backward + optimizer graphs
-    // that ggml_opt_build duplicates from it.
-    {
-        const uint32_t n_tokens_train = std::min(this->n_ubatch(), n_ubatch);
-        const int64_t inflated = this->graph_max_nodes(n_tokens_train);
-        gf_res_prev.reset(new llm_graph_result(inflated));
-    }
 
     llama_opt_param_filter param_filter = lopt_params.param_filter;
     void * param_filter_ud              = lopt_params.param_filter_ud;
