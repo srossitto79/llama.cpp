@@ -11,7 +11,7 @@ PYTHON=python3
 echo "=== Nemotron REAP Expert Pruning ==="
 echo "Keep ratio: 0.5 (64/128 experts per MoE layer)"
 echo "Stats file: $WORKSPACE/expert_stats_reap.json"
-echo "Output dir: $WORKSPACE/nemotron-pruned-0.5"
+echo "Output file: $WORKSPACE/nemotron-3-trader-15b-Q4_K_M.gguf"
 echo ""
 
 cd "$WORKSPACE"
@@ -24,4 +24,4 @@ cd "$WORKSPACE"
 
 echo ""
 echo "=== Prune complete ==="
-echo "Pruned model saved to: $WORKSPACE/nemotron-pruned-0.5"
+echo "Pruned model saved to: $WORKSPACE/nemotron-3-trader-15b-Q4_K_M.gguf"
