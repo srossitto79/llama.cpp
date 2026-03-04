@@ -512,7 +512,11 @@ struct common_params {
     // qlora finetune
     int32_t     lora_rank      = 16;              // LoRA rank (r)
     float       lora_alpha     = 0.0f;            // LoRA alpha (0 = use rank value)
-    std::string lora_targets   = "attn_q,attn_k,attn_v,attn_v_b,attn_out"; // comma-separated substrings to match trainable tensors
+    // Substrings match llama.cpp internal GGUF tensor names (NOT HuggingFace names):
+    //   attn_q=q_proj  attn_k=k_proj  attn_v=v_proj  attn_output=o_proj
+    //   ffn_gate=gate_proj  ffn_up=up_proj  ffn_down=down_proj
+    //   ssm_in=in_proj  ssm_out=out_proj  (Mamba/NemotronH layers)
+    std::string lora_targets   = "attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down,ssm_in,ssm_out"; // comma-separated substrings to match trainable tensors
     std::string lora_out       = "adapter.gguf";  // output adapter GGUF path
     std::string train_file     = "";              // JSONL training dataset path
 

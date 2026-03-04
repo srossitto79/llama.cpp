@@ -6,14 +6,21 @@
 // is saved as a GGUF file that is directly compatible with the existing
 // llama_adapter_lora_init() loader and llama-export-lora merge tool.
 //
-// Usage example:
+// Usage example (Nemotron / NemotronH — attention + MLP + Mamba layers):
 //   llama-finetune-qlora \
-//     --model llama-3.2-1b-q4_k_m.gguf \
-//     --file  train.jsonl \
+//     --model nemotron-h-q4_k_m.gguf \
+//     --train-file train.jsonl \
 //     --lora-rank 16 --lora-alpha 16 \
-//     --lora-targets "attn_q,attn_k,attn_v,attn_out" \
+//     --lora-targets "attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down,ssm_in,ssm_out" \
 //     --lora-out adapter.gguf \
 //     -e 3 -c 512
+//
+// Target substrings use llama.cpp internal GGUF names (NOT HuggingFace names):
+//   attn_q      = q_proj       attn_k     = k_proj
+//   attn_v      = v_proj       attn_output= o_proj
+//   ffn_gate    = gate_proj    ffn_up     = up_proj    ffn_down = down_proj
+//   ssm_in      = in_proj (Mamba/NemotronH)
+//   ssm_out     = out_proj (Mamba/NemotronH)
 
 #include "arg.h"
 #include "chat.h"
@@ -367,11 +374,13 @@ static void save_adapter(
     std::vector<char> zeros_buf(meta_size, 0);
     fout.write(zeros_buf.data(), meta_size);
 
-    // Write tensor data
+    // Write tensor data — copy to CPU first in case tensors live on GPU
     for (const auto & kv : lt.ab) {
         for (ggml_tensor * t : {kv.second.first, kv.second.second}) {
             const size_t nb = ggml_nbytes(t);
-            fout.write((const char *) t->data, nb);
+            std::vector<char> cpu_buf(nb);
+            ggml_backend_tensor_get(t, cpu_buf.data(), 0, nb);
+            fout.write(cpu_buf.data(), nb);
             // GGUF tensors are 32-byte aligned
             const size_t pad = GGML_PAD(nb, 32) - nb;
             if (pad > 0) {
@@ -407,11 +416,52 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    if (params.train_file.empty()) {
+        LOG_ERR("%s: --train-file is required\n", __func__);
+        return 1;
+    }
+
     // Force settings required for training
-    params.use_mmap    = false;
+    params.use_mmap     = false;
     params.cache_type_k = GGML_TYPE_F32;
     params.cache_type_v = GGML_TYPE_F32;
 
+    const float lora_alpha = (params.lora_alpha > 0.0f)
+        ? params.lora_alpha : (float) params.lora_rank;
+    const auto targets = split_csv(params.lora_targets);
+
+    // --- Step 1: Discover tensor shapes from model GGUF (no model load yet) ---
+    std::string arch;
+    {
+        struct ggml_context * ctx_meta = nullptr;
+        struct gguf_init_params gp = { true, &ctx_meta };
+        struct gguf_context * ctx_gguf = gguf_init_from_file(params.model.path.c_str(), gp);
+        if (!ctx_gguf) { LOG_ERR("failed to open model GGUF\n"); return 1; }
+        int kid = gguf_find_key(ctx_gguf, "general.architecture");
+        if (kid >= 0) arch = gguf_get_val_str(ctx_gguf, kid);
+        gguf_free(ctx_gguf);
+        ggml_free(ctx_meta);
+    }
+
+    // --- Step 2: Allocate LoRA tensors and save initial adapter GGUF ---
+    // The initial adapter (B=zeros, A=random) must exist on disk BEFORE context
+    // creation so that common_init_from_params loads it via params.lora_adapters.
+    // This causes sched_reserve to size the graph to include LoRA nodes, preventing
+    // the cgraph overflow that occurs when the adapter is activated post-init.
+    std::mt19937 rng(42);
+    auto lt = alloc_lora_tensors(params.model.path, targets, params.lora_rank, rng);
+    if (lt.ab.empty()) return 1;
+
+    const std::string init_adapter_path = params.lora_out + ".init.gguf";
+    save_adapter(lt, init_adapter_path, arch, lora_alpha);
+
+    // Register adapter so common_init_from_params loads it before context creation
+    common_adapter_lora_info adapter_info;
+    adapter_info.path  = init_adapter_path;
+    adapter_info.scale = 1.0f;
+    params.lora_adapters.push_back(adapter_info);
+
+    // --- Step 3: Load model + context (graph sized with LoRA nodes) ---
     common_init();
     llama_backend_init();
     llama_numa_init(params.numa);
@@ -424,44 +474,41 @@ int main(int argc, char ** argv) {
 
     LOG_INF("%s\n", common_params_get_system_info(params).c_str());
 
-    // Resolve LoRA alpha (default: same as rank → effective scale = 1)
-    const float lora_alpha = (params.lora_alpha > 0.0f)
-        ? params.lora_alpha
-        : (float) params.lora_rank;
-
-    // Parse target substrings
-    const auto targets = split_csv(params.lora_targets);
-
-    // Get model architecture string directly from the GGUF metadata
-    std::string arch;
-    {
-        struct ggml_context * ctx_meta = nullptr;
-        struct gguf_init_params gp = { true, &ctx_meta };
-        struct gguf_context * ctx_gguf = gguf_init_from_file(params.model.path.c_str(), gp);
-        if (ctx_gguf) {
-            int kid = gguf_find_key(ctx_gguf, "general.architecture");
-            if (kid >= 0) arch = gguf_get_val_str(ctx_gguf, kid);
-            gguf_free(ctx_gguf);
-            ggml_free(ctx_meta);
-        }
-    }
+    // Arch fallback if not in GGUF metadata
     if (arch.empty()) {
-        // Fall back to model description
-        char arch_buf[256] = {};
-        llama_model_desc(model, arch_buf, sizeof(arch_buf));
-        arch = std::string(arch_buf);
+        char buf[256] = {};
+        llama_model_desc(model, buf, sizeof(buf));
+        arch = std::string(buf);
         arch = arch.substr(0, arch.find_first_of(" /"));
     }
 
-    // Load chat templates (optional — falls back to ChatML if unavailable)
-    auto tmpls = common_chat_templates_init(model, "");
-
-    // Load JSONL dataset
-    if (params.train_file.empty()) {
-        LOG_ERR("%s: --train-file is required\n", __func__);
-        return 1;
+    // --- Step 4: Mark the loaded adapter tensors as trainable ---
+    // common_init_from_params loaded the adapter; params.lora_adapters[back].ptr
+    // points to the live llama_adapter_lora with its own tensor copies in device
+    // memory. Mark those tensors trainable so the optimizer graph includes them.
+    {
+        llama_adapter_lora * loaded = params.lora_adapters.back().ptr;
+        if (!loaded) {
+            LOG_ERR("%s: adapter was not loaded by common_init_from_params\n", __func__);
+            return 1;
+        }
+        for (auto & kv : loaded->ab_map) {
+            ggml_set_param(kv.second.a);  // lora_a → trainable
+            ggml_set_param(kv.second.b);  // lora_b → trainable
+        }
+        // Update lt.ab to point to the loaded tensors so save_adapter writes
+        // the trained weights (not the original init tensors).
+        lt.ab.clear();
+        for (auto & kv : loaded->ab_map) {
+            lt.ab[kv.first] = {kv.second.a, kv.second.b};
+        }
     }
 
+    // Remove init file (no longer needed; final save uses params.lora_out)
+    std::remove(init_adapter_path.c_str());
+
+    // --- Step 5: Load dataset ---
+    auto tmpls = common_chat_templates_init(model, "");
     auto samples = load_jsonl(params.train_file, ctx, tmpls.get());
     if (samples.empty()) {
         LOG_ERR("%s: no training samples loaded\n", __func__);
@@ -471,38 +518,6 @@ int main(int argc, char ** argv) {
     const int32_t n_ctx = llama_n_ctx(ctx);
     auto dataset = build_dataset(samples, n_ctx);
     if (!dataset) return 1;
-
-    // Allocate LoRA tensors (reads tensor shapes from model GGUF directly)
-    std::mt19937 rng(42);
-    auto lt = alloc_lora_tensors(params.model.path, targets, params.lora_rank, rng);
-    if (lt.ab.empty()) return 1;
-
-    // Build a llama_adapter_lora directly from our lt.ab tensors and activate it
-    // on the context so that build_lora_mm injects the LoRA deltas at graph build
-    // time inside llama_opt_init.  The adapter struct is populated manually from
-    // the internal header (src/llama-adapter.h) to avoid a temp-file round-trip.
-    //
-    // Ownership: lt.ctx/lt.buf own the tensor memory; the adapter just holds
-    // pointers.  All objects outlive training.
-    llama_adapter_lora lora_adapter;
-    lora_adapter.alpha = lora_alpha;
-
-    for (auto & kv : lt.ab) {
-        llama_adapter_lora_weight lw(kv.second.first, kv.second.second);
-        lora_adapter.ab_map[kv.first] = lw;
-
-        // Mark A/B as trainable BEFORE llama_opt_init builds the graph.
-        // llama_set_param (in opt_init) won't find these because they are not
-        // in model->layers — we mark them directly here instead.
-        ggml_set_param(kv.second.first);   // lora_a
-        ggml_set_param(kv.second.second);  // lora_b
-    }
-
-    {
-        struct llama_adapter_lora * ap = &lora_adapter;
-        float scale = 1.0f;
-        llama_set_adapters_lora(ctx, &ap, 1, &scale);
-    }
 
     // Initialize optimizer — our custom param filter restricts training to lora_a/b
     struct llama_opt_params lopt_params {
