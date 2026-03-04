@@ -73,9 +73,11 @@ llama.cpp uses **internal GGUF tensor names**, not HuggingFace names:
 | `ssm_in` | `in_proj` | Mamba / NemotronH SSM |
 | `ssm_out` | `out_proj` | Mamba / NemotronH SSM |
 
-Default: `attn_q,attn_output,ffn_gate,ffn_up,ffn_down,ssm_in,ssm_out`
+Default: `attn_q,attn_output,ffn_gate,ffn_up,ffn_down`
 
-> **Note on K/V projections**: `attn_k` and `attn_v` are excluded from the default targets because the KV cache write path uses `ggml_set_rows` (a scatter op). In ggml's current backward graph, the read and write branches of the KV cache are disconnected — gradients cannot flow from the attention output back through `set_rows` to the LoRA K/V tensors. Including them costs VRAM but contributes no learning signal. A custom fork of ggml that routes gradients through the KV cache write would be required to train K/V adapters correctly.
+> **Targets excluded from default** — can be added via `--lora-targets` but receive zero gradient:
+> - `attn_k`, `attn_v`: KV cache write uses `ggml_set_rows` (scatter op, no backward). Gradients cannot flow back to LoRA K/V adapters.
+> - `ssm_in`, `ssm_out`: Mamba SSM layers use `SSM_SCAN`/`SSM_CONV` (no backward implementation). LoRA SSM adapters will not learn.
 
 ### Dataset format (JSONL)
 

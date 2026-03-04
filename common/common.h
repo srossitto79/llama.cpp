@@ -516,10 +516,12 @@ struct common_params {
     //   attn_q=q_proj  attn_k=k_proj  attn_v=v_proj  attn_output=o_proj
     //   ffn_gate=gate_proj  ffn_up=up_proj  ffn_down=down_proj
     //   ssm_in=in_proj  ssm_out=out_proj  (Mamba/NemotronH layers)
-    // K and V projections feed into the KV cache via SET_ROWS (scatter write). The backward graph
-    // cannot propagate gradients through SET_ROWS back to the LoRA K/V tensors — the KV read and
-    // write are separate graph branches. Include attn_k/attn_v only if you understand this limitation.
-    std::string lora_targets   = "attn_q,attn_output,ffn_gate,ffn_up,ffn_down,ssm_in,ssm_out"; // comma-separated substrings to match trainable tensors
+    // Targets whose gradient path passes through ops with no backward implementation receive
+    // zero gradient even if listed. Known dead-end paths:
+    //   attn_k, attn_v  — KV cache write uses SET_ROWS (no backward)
+    //   ssm_in, ssm_out — Mamba SSM uses SSM_SCAN/SSM_CONV (no backward)
+    // Add them explicitly via --lora-targets to experiment; they won't crash but won't learn.
+    std::string lora_targets   = "attn_q,attn_output,ffn_gate,ffn_up,ffn_down"; // comma-separated substrings to match trainable tensors
     std::string lora_out       = "adapter.gguf";  // output adapter GGUF path
     std::string train_file     = "";              // JSONL training dataset path
 

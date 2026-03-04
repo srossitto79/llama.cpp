@@ -6907,10 +6907,21 @@ void ggml_build_backward_expand(
 
             // gradients in node->src[1] for one reason or another have no effect on output gradients
             case GGML_OP_CPY:           // gradients in CPY target are irrelevant
-            case GGML_OP_GET_ROWS:      // row indices not differentiable
             case GGML_OP_GET_ROWS_BACK: // same as for GET_ROWS
             case GGML_OP_ROPE:          // positions not differentiable
                 ignore_src[1] = true;
+                break;
+
+            case GGML_OP_GET_ROWS:
+                // Row indices (src[1]) are never differentiable.
+                ignore_src[1] = true;
+                // get_rows_back() only supports 2-D tables (ggml_is_matrix check).
+                // When src[0] is a higher-dimensional hidden-state tensor (output-token
+                // selection in models like NemotronH), the backward cannot be computed —
+                // stop gradient propagation through src[0] in that case.
+                if (node->src[0] && !ggml_is_matrix(node->src[0])) {
+                    ignore_src[0] = true;
+                }
                 break;
 
             // SET_ROWS is a KV-cache scatter write: result is a view of the cache buffer (view_src set),
@@ -6924,13 +6935,16 @@ void ggml_build_backward_expand(
                 ignore_src[2] = true;
                 break;
 
-            // MUL_MAT_ID is sparse MoE expert dispatch — no backward implementation exists.
-            // Stop gradient propagation through all its sources so the backward graph builder
-            // does not try to compute a gradient for this node.
-            case GGML_OP_MUL_MAT_ID:
+            // Ops with no backward implementation — stop gradient propagation through all
+            // their sources so the backward graph builder never tries to compute a gradient.
+            case GGML_OP_MUL_MAT_ID:    // sparse MoE expert dispatch
+            case GGML_OP_SSM_SCAN:      // Mamba2 selective-scan (state update + output)
+            case GGML_OP_SSM_CONV:      // Mamba2 causal conv1d over SSM state
+            case GGML_OP_FLASH_ATTN_EXT: // flash attention has no backward; use standard attn for training
                 ignore_src[0] = true;
                 ignore_src[1] = true;
                 ignore_src[2] = true;
+                ignore_src[3] = true;
                 break;
 
             default:

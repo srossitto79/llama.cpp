@@ -1953,12 +1953,21 @@ void llama_context::output_reorder() {
 //
 
 uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
+    uint32_t res;
     if (model.arch == LLM_ARCH_QWEN3NEXT || model.arch == LLM_ARCH_KIMI_LINEAR || model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE) {
-        return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+    } else {
+        res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
+        for (const auto & lora : model.loras) {
+            res += lora->get_n_nodes();
+        }
     }
-    uint32_t res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
-    for (const auto & lora : model.loras) {
-        res += lora->get_n_nodes();
+    // During training, the backward graph is duplicated from the forward graph (ggml_graph_dup
+    // copies gf->size).  gb_grad adds ~2-3x more nodes (grad tensors + backward ops), and gb_opt
+    // adds optimizer step nodes on top.  Pre-inflate the forward graph size so the duplicates
+    // have enough capacity.  This has no effect on inference (opt_ctx is null).
+    if (opt_ctx) {
+        res *= 4;
     }
     return res;
 }
@@ -2580,6 +2589,16 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     opt_params.optimizer       = lopt_params.optimizer_type;
     opt_ctx = ggml_opt_init(opt_params);
 
+    // Recreate gf_res_prev with the training-inflated graph size (graph_max_nodes returns 4x
+    // when opt_ctx is set).  gf_res_prev was created during sched_reserve when opt_ctx was
+    // null, so it has the un-inflated capacity — too small for the backward + optimizer graphs
+    // that ggml_opt_build duplicates from it.
+    {
+        const uint32_t n_tokens_train = std::min(this->n_ubatch(), n_ubatch);
+        const int64_t inflated = this->graph_max_nodes(n_tokens_train);
+        gf_res_prev.reset(new llm_graph_result(inflated));
+    }
+
     llama_opt_param_filter param_filter = lopt_params.param_filter;
     void * param_filter_ud              = lopt_params.param_filter_ud;
 
@@ -2681,7 +2700,11 @@ void llama_context::opt_epoch_iter(
             struct ggml_context * ctx_compute_opt;
             {
                 const size_t size_gf = ggml_graph_size(gf);
-                const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 2*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
+                // graph_max_nodes() pre-inflates size_gf by 4x during training so that
+                // gb_grad = ggml_graph_dup(gf) and gb_opt = ggml_graph_dup(gb_grad) both
+                // have enough capacity for the backward+optimizer nodes.
+                // The context needs space for tensor metadata of 3 graphs of size_gf each.
+                const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 3*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
                 struct ggml_init_params params = {
                     /*.mem_size   =*/ size_meta,
                     /*.mem_buffer =*/ nullptr,

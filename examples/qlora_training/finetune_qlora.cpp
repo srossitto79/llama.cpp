@@ -453,6 +453,8 @@ int main(int argc, char ** argv) {
     // Warmup runs inference with PARAM-flagged tensors which causes a segfault;
     // training never benefits from warmup, so disable it unconditionally.
     params.warmup       = false;
+    // Flash attention has no backward implementation; force standard attention for training.
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
 
     const float lora_alpha = (params.lora_alpha > 0.0f)
         ? params.lora_alpha : (float) params.lora_rank;
