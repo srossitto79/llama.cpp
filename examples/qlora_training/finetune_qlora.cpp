@@ -7,18 +7,23 @@
 // llama_adapter_lora_init() loader and llama-export-lora merge tool.
 //
 // Usage example (Nemotron / NemotronH — attention + MLP + Mamba layers):
-//   llama-finetune-qlora \
-//     --model nemotron-h-q4_k_m.gguf \
-//     --train-file train.jsonl \
-//     --lora-rank 16 --lora-alpha 16 \
-//     --lora-targets "attn_q,attn_output,ffn_gate,ffn_up,ffn_down,ssm_in,ssm_out" \
-//     --lora-out adapter.gguf \
-//     -e 3 -c 512
-//
+/*   llama-finetune-qlora \
+         --model nemotron-h-q4_k_m.gguf \
+         --train-file train.jsonl \
+         --lora-rank 16 --lora-alpha 16 \
+         --lora-targets "attn_q,attn_output,ffn_gate,ffn_up,ffn_down,ssm_in,ssm_out" \
+         --lora-out adapter.gguf \
+         -e 3 -c 512
+*/    
 // NOTE: attn_k and attn_v are excluded from the default targets.  The KV write path uses
 // ggml_set_rows (a scatter op with view_src set) and the backward graph cannot propagate
 // gradients through it — LoRA K/V would receive zero gradient.  You can add them explicitly
 // with --lora-targets if you want to experiment, but expect no learning signal for K/V.
+//
+// NOTE: MoE expert tensors (*_exps: ffn_gate_exps, ffn_up_exps, ffn_down_exps) are always
+// excluded regardless of --lora-targets.  They use ggml_mul_mat_id (sparse expert dispatch)
+// which has no backward implementation.  Dense FFN tensors (ffn_gate, ffn_up, ffn_down on
+// non-MoE layers) are still trainable.
 //
 // Target substrings use llama.cpp internal GGUF names (NOT HuggingFace names):
 //   attn_q      = q_proj       attn_k     = k_proj
@@ -69,7 +74,22 @@ static std::vector<std::string> split_csv(const std::string & s) {
     return out;
 }
 
+// Tensors whose names contain these substrings use MUL_MAT_ID (sparse MoE expert dispatch)
+// which has no backward implementation — exclude them from LoRA targets unconditionally.
+static const std::vector<std::string> EXCLUDED_SUBSTRINGS = {
+    "_exps",      // MoE expert weight stacks (ffn_gate_exps, ffn_up_exps, ffn_down_exps, ffn_gate_up_exps)
+};
+
+static bool tensor_is_excluded(const char * name) {
+    const std::string n(name);
+    for (const auto & ex : EXCLUDED_SUBSTRINGS) {
+        if (n.find(ex) != std::string::npos) return true;
+    }
+    return false;
+}
+
 static bool tensor_matches_targets(const char * name, const std::vector<std::string> & targets) {
+    if (tensor_is_excluded(name)) return false;
     for (const auto & t : targets) {
         if (std::string(name).find(t) != std::string::npos) return true;
     }

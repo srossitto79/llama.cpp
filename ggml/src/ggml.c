@@ -6924,6 +6924,15 @@ void ggml_build_backward_expand(
                 ignore_src[2] = true;
                 break;
 
+            // MUL_MAT_ID is sparse MoE expert dispatch — no backward implementation exists.
+            // Stop gradient propagation through all its sources so the backward graph builder
+            // does not try to compute a gradient for this node.
+            case GGML_OP_MUL_MAT_ID:
+                ignore_src[0] = true;
+                ignore_src[1] = true;
+                ignore_src[2] = true;
+                break;
+
             default:
                 break;
         }
