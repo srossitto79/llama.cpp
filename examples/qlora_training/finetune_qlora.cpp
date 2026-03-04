@@ -11,9 +11,14 @@
 //     --model nemotron-h-q4_k_m.gguf \
 //     --train-file train.jsonl \
 //     --lora-rank 16 --lora-alpha 16 \
-//     --lora-targets "attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down,ssm_in,ssm_out" \
+//     --lora-targets "attn_q,attn_output,ffn_gate,ffn_up,ffn_down,ssm_in,ssm_out" \
 //     --lora-out adapter.gguf \
 //     -e 3 -c 512
+//
+// NOTE: attn_k and attn_v are excluded from the default targets.  The KV write path uses
+// ggml_set_rows (a scatter op with view_src set) and the backward graph cannot propagate
+// gradients through it — LoRA K/V would receive zero gradient.  You can add them explicitly
+// with --lora-targets if you want to experiment, but expect no learning signal for K/V.
 //
 // Target substrings use llama.cpp internal GGUF names (NOT HuggingFace names):
 //   attn_q      = q_proj       attn_k     = k_proj
@@ -425,6 +430,9 @@ int main(int argc, char ** argv) {
     params.use_mmap     = false;
     params.cache_type_k = GGML_TYPE_F32;
     params.cache_type_v = GGML_TYPE_F32;
+    // Warmup runs inference with PARAM-flagged tensors which causes a segfault;
+    // training never benefits from warmup, so disable it unconditionally.
+    params.warmup       = false;
 
     const float lora_alpha = (params.lora_alpha > 0.0f)
         ? params.lora_alpha : (float) params.lora_rank;

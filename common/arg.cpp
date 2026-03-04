@@ -3600,7 +3600,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
         {"--lora-alpha"}, "F",
-        string_format("LoRA alpha (default: 0 = use rank value)", (double) params.lora_alpha),
+        string_format("LoRA alpha (default: %d = use rank value)", (int) params.lora_alpha),
         [](common_params & params, const std::string & value) { params.lora_alpha = std::stof(value); }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(

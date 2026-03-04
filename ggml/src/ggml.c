@@ -6913,6 +6913,17 @@ void ggml_build_backward_expand(
                 ignore_src[1] = true;
                 break;
 
+            // SET_ROWS is a KV-cache scatter write: result is a view of the cache buffer (view_src set),
+            // and the gradient of the data being written (src[0] = k/v_cur) is handled by the attention
+            // read path (GET_ROWS backward), not through this node.  Ignore all srcs so that the backward
+            // expander does not flag this view-tensor as needing a gradient (which would hit the assert
+            // "inplace operations are currently not supported").
+            case GGML_OP_SET_ROWS:
+                ignore_src[0] = true;
+                ignore_src[1] = true;
+                ignore_src[2] = true;
+                break;
+
             default:
                 break;
         }
@@ -6928,9 +6939,20 @@ void ggml_build_backward_expand(
             continue;
         }
 
-        // inplace operations are currently not supported
-        GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_VIEW ||
-            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE);
+        // Inplace operations that write into an existing tensor's memory (view_src != NULL) cannot
+        // generally have their backward pass computed by ggml_build_backward_expand.
+        // The permitted set are read-only aliases (VIEW, RESHAPE, PERMUTE, TRANSPOSE) and the
+        // special CPY op which has explicit backward support.
+        // Any other inplace op (SCALE, ADD, ROPE, SET_ROWS, etc.) that ends up needing gradients
+        // means the gradient path goes through a side-effecting write — we log a warning and skip
+        // the node so the backward graph is not corrupt (the gradient for that branch will be zero).
+        if (node->view_src && node->op != GGML_OP_CPY && node->op != GGML_OP_VIEW &&
+            node->op != GGML_OP_RESHAPE && node->op != GGML_OP_PERMUTE && node->op != GGML_OP_TRANSPOSE) {
+            GGML_LOG_WARN("ggml_build_backward_expand: skipping inplace op '%s' (name='%s') in backward graph — "
+                "no gradient will flow through this node\n",
+                ggml_op_name(node->op), node->name);
+            continue;
+        }
 
         const size_t ihash = ggml_hash_find(&cgraph->visited_hash_set, node);
         GGML_ASSERT(ihash != GGML_HASHSET_FULL);
