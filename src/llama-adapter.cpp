@@ -334,17 +334,31 @@ static void llama_adapter_lora_init_impl(llama_model & model, const char * path_
 
         auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
 
-        // do not load loras to extra buffer types (i.e. bufts for repacking) -> use the CPU in that case
+        // do not load loras to extra buffer types (i.e. bufts for repacking).
+        // For training, prefer the native device buffer type (e.g. regular CUDA) so that
+        // LoRA tensors stay on GPU and avoid slow CPU<->GPU transfers during backprop.
+        // For inference-only (no PARAM flag), fall back to CPU as before.
         for (auto & ex : buft_extra) {
             if (ex == buft) {
-                LLAMA_LOG_WARN("%s: lora for '%s' cannot use buft '%s', fallback to CPU\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
-
-                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-                if (!cpu_dev) {
-                    throw std::runtime_error(format("%s: no CPU backend found", __func__));
+                // Try to stay on the same device (e.g. CUDA device 0) using its default buft.
+                auto * dev = ggml_backend_buft_get_device(buft);
+                ggml_backend_buffer_type_t fallback_buft = nullptr;
+                if (dev) {
+                    fallback_buft = ggml_backend_dev_buffer_type(dev);
                 }
-                buft = ggml_backend_dev_buffer_type(cpu_dev);
-
+                if (!fallback_buft) {
+                    // True fallback: CPU (inference-only path)
+                    LLAMA_LOG_WARN("%s: lora for '%s' cannot use buft '%s', fallback to CPU\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
+                    auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                    if (!cpu_dev) {
+                        throw std::runtime_error(format("%s: no CPU backend found", __func__));
+                    }
+                    buft = ggml_backend_dev_buffer_type(cpu_dev);
+                } else {
+                    LLAMA_LOG_DEBUG("%s: lora for '%s': repack buft '%s' → device default '%s'\n",
+                            __func__, model_tensor->name, ggml_backend_buft_name(ex), ggml_backend_buft_name(fallback_buft));
+                    buft = fallback_buft;
+                }
                 break;
             }
         }

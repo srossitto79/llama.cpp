@@ -2575,28 +2575,29 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
 
     // Recreate the scheduler and gf_res_prev with a training-inflated graph size before
     // creating opt_ctx, so opt_ctx captures the new (larger) scheduler pointer.
-    // The backward graph (gb_grad) duplicates gf's size and adds ~2-3x more nodes+leafs;
-    // gb_opt adds optimizer step nodes on top.  Use 8x the un-inflated forward graph size
-    // as a conservative upper bound that covers both n_nodes and n_leafs of gb_opt.
+    // The backward graph (gb_grad) duplicates gf and adds ~2-3x more nodes+leafs;
+    // gb_opt adds optimizer step nodes on top.
+    // We base the size on the actual measured forward graph node count from sched_reserve,
+    // not a formula based on n_tensors — the formula massively over-allocates on small models.
+    // Multiply by 4 to cover gb_grad + gb_opt, then by 2 for the scheduler's n_nodes+n_leafs check.
     {
-        // graph_max_nodes() uses opt_ctx to decide whether to inflate; call it with the
-        // un-inflated result and apply the training multiplier (8x) manually here.
-        const uint32_t base_nodes = [&]() {
-            // temporarily null opt_ctx so graph_max_nodes returns the base value
-            return std::max<uint32_t>(1024u, 8u * model->n_tensors());
-        }();
-        const int64_t inflated     = (int64_t)base_nodes * 8;   // graph node slots (4x forward)
-        const int64_t sched_size   = inflated * 2;              // +leafs headroom for backward
+        // gf_res_reserve was built by sched_reserve() with the real forward graph.
+        // Its max_nodes is the capacity that fit the forward pass — use that as our base.
+        const llm_graph_result * fwd = static_cast<llm_graph_result *>(gf_res_reserve.get());
+        const uint32_t fwd_nodes   = fwd ? (uint32_t)fwd->get_max_nodes() : std::max<uint32_t>(1024u, 8u * model->n_tensors());
+        const int64_t inflated     = (int64_t)std::max<uint32_t>(fwd_nodes, 1024u) * 4;  // gf+gb_grad+gb_opt
+        const int64_t sched_size   = inflated * 2;  // scheduler checks n_nodes + n_leafs
         gf_res_prev.reset(new llm_graph_result(inflated));
         sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
                                            sched_size, cparams.pipeline_parallel, cparams.op_offload));
     }
 
     ggml_opt_params opt_params = ggml_opt_default_params(sched.get(), GGML_OPT_LOSS_TYPE_CROSS_ENTROPY);
-    opt_params.opt_period      = n_batch / n_ubatch;
-    opt_params.get_opt_pars    = lopt_params.get_opt_pars;
-    opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
-    opt_params.optimizer       = lopt_params.optimizer_type;
+    opt_params.opt_period                = n_batch / n_ubatch;
+    opt_params.get_opt_pars              = lopt_params.get_opt_pars;
+    opt_params.get_opt_pars_ud           = lopt_params.get_opt_pars_ud;
+    opt_params.optimizer                 = lopt_params.optimizer_type;
+    opt_params.grad_checkpoint_interval  = lopt_params.grad_checkpoint_interval;
     opt_ctx = ggml_opt_init(opt_params);
 
     llama_opt_param_filter param_filter = lopt_params.param_filter;
@@ -2680,6 +2681,7 @@ void llama_context::opt_epoch_iter(
         };
 
         uint32_t pos_batch = 0;
+        static bool timings_printed = false;  // print per-ubatch timings only for the first window
         do {
             const auto & ubatch = mctx->get_ubatch();
 
@@ -2692,6 +2694,7 @@ void llama_context::opt_epoch_iter(
 
             auto * res = gf_res_prev.get();
 
+            const int64_t t0_build = ggml_time_ms();
             const auto gparams = graph_params(res, ubatch, mctx.get(), LLM_GRAPH_TYPE_DEFAULT);
 
             res->reset();
@@ -2712,10 +2715,17 @@ void llama_context::opt_epoch_iter(
                     /*.no_alloc   =*/ true,
                 };
                 ctx_compute_opt = ggml_init(params);
+                if (!timings_printed) {
+                    LLAMA_LOG_INFO("%s: [timing] graph capacity=%zu n_nodes=%d size_meta=%.1fMB\n", __func__,
+                            size_gf, ggml_graph_n_nodes(gf), (double)size_meta / (1024*1024));
+                }
             }
+
+            const int64_t t1_alloc = ggml_time_ms();
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
             ggml_opt_alloc(opt_ctx, train);
 
+            const int64_t t2_inputs = ggml_time_ms();
             res->set_inputs(&ubatch);
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
@@ -2727,7 +2737,22 @@ void llama_context::opt_epoch_iter(
                     ggml_backend_tensor_set(labels, &reward_scale, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                 }
             }
+
+            const int64_t t3_eval = ggml_time_ms();
             ggml_opt_eval(opt_ctx, result);
+
+            const int64_t t4_done = ggml_time_ms();
+            if (!timings_printed) {
+                LLAMA_LOG_INFO("%s: [timing] build=%" PRId64 "ms alloc=%" PRId64 "ms inputs=%" PRId64 "ms eval=%" PRId64 "ms total=%" PRId64 "ms\n",
+                        __func__,
+                        t1_alloc - t0_build,
+                        t2_inputs - t1_alloc,
+                        t3_eval - t2_inputs,
+                        t4_done - t3_eval,
+                        t4_done - t0_build);
+                timings_printed = true;
+            }
+
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
             }

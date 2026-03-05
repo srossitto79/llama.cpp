@@ -3624,6 +3624,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) { params.save_every = value; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
+        {"--freeze-layers"}, "N",
+        "freeze first N transformer layers — no LoRA adapters are allocated for blk.0 .. blk.N-1 "
+        "(the backward graph already skips frozen layers automatically via the grads_needed pruner; "
+        "this just avoids allocating adapter weights for them; default: 0 = train all layers)",
+        [](common_params & params, int value) { params.lora_freeze_layers = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    add_opt(common_arg(
+        {"--grad-checkpoint"}, "N",
+        "gradient checkpointing interval: mark every Nth forward graph node as persistent so the "
+        "allocator cannot reuse its memory during backward — reduces peak activation VRAM with near-zero "
+        "compute overhead (activations are kept, not recomputed).  Good starting value: 32–64 ≈ 1–2 layers. "
+        "default: 0 = disabled",
+        [](common_params & params, int value) { params.grad_checkpoint_interval = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    add_opt(common_arg(
         {"--save-logits"},
         string_format("save final logits to files for verification (default: %s)", params.save_logits ? "true" : "false"),
         [](common_params & params) {

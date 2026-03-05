@@ -62,6 +62,7 @@ struct ggml_opt_context {
     int64_t iter               = 1;
     int32_t opt_period         = 1;
     int32_t opt_i              = 0;
+    int32_t grad_checkpoint_interval = 0;
     bool    loss_per_datapoint = false;
 
     ggml_opt_get_optimizer_params get_opt_pars    = nullptr;
@@ -485,6 +486,31 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         }
     }
 
+    // Gradient checkpointing: mark every Nth forward node as OUTPUT so the allocator
+    // keeps its memory alive through the backward pass.  The backward graph already
+    // contains the forward ops (gb_grad is a superset of gf), so the checkpointed
+    // activations are naturally available for backward matmuls without recomputation.
+    // This prevents the allocator from aliasing those buffers to later ops, cutting
+    // peak activation VRAM at the cost of slightly larger static allocation.
+    if (opt_ctx->grad_checkpoint_interval > 0) {
+        const int interval = opt_ctx->grad_checkpoint_interval;
+        const int n_fwd    = opt_ctx->gf->n_nodes;
+        int ckpt_count = 0;
+        for (int i = interval - 1; i < n_fwd; i += interval) {
+            struct ggml_tensor * node = opt_ctx->gf->nodes[i];
+            // Only checkpoint F32 compute nodes — skip I32 index tensors and already-output nodes.
+            if (node->type != GGML_TYPE_F32) continue;
+            if (node->flags & GGML_TENSOR_FLAG_OUTPUT)  continue;
+            if (node->flags & GGML_TENSOR_FLAG_INPUT)   continue;
+            node->flags |= GGML_TENSOR_FLAG_OUTPUT;
+            ckpt_count++;
+        }
+        if (ckpt_count > 0) {
+            GGML_LOG_DEBUG("%s: gradient checkpointing: marked %d/%d nodes as persistent (interval=%d)\n",
+                __func__, ckpt_count, n_fwd, interval);
+        }
+    }
+
     // gb_grad == graph backward gradients, forward pass, then backward pass to calculate gradients.
     opt_ctx->gb_grad = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gf, /*force_grads =*/ true);
     ggml_build_backward_expand(opt_ctx->ctx_compute, opt_ctx->gb_grad, opt_ctx->grad_accs.data());
@@ -555,10 +581,11 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->build_type_alloc = params.build_type;
     result->inputs           = params.inputs;
     result->outputs          = params.outputs;
-    result->opt_period       = params.opt_period;
-    result->get_opt_pars     = params.get_opt_pars;
-    result->get_opt_pars_ud  = params.get_opt_pars_ud;
-    result->optimizer        = params.optimizer;
+    result->opt_period                = params.opt_period;
+    result->grad_checkpoint_interval  = params.grad_checkpoint_interval;
+    result->get_opt_pars              = params.get_opt_pars;
+    result->get_opt_pars_ud           = params.get_opt_pars_ud;
+    result->optimizer                 = params.optimizer;
 
     GGML_ASSERT(result->opt_period >= 1);
 

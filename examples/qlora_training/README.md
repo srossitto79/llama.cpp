@@ -1,183 +1,217 @@
-# llama.cpp/examples/qlora_training
+# llama.cpp — Native QLoRA Training
 
-Native QLoRA + Reward-Weighted SFT + GRPO training pipeline for quantized GGUF models.
+Native QLoRA + Reward-Weighted SFT training pipeline for quantized GGUF models.
 
 The base model weights remain **frozen** (quantized tensors are skipped by `llama_set_param` because they are not `GGML_TYPE_F32`). Only freshly-allocated F32 LoRA A/B tensors are trained. The saved adapter GGUF is directly compatible with the existing `llama_adapter_lora_init` loader and `llama-export-lora` merge tool.
 
----
-
-## Tools
-
-| Binary | Description |
-|---|---|
-| `llama-finetune-qlora` | Phase 1 — QLoRA SFT on a quantized GGUF |
-| `llama-finetune-rwsft` | Phase 2 — Reward-Weighted SFT (reward in dataset) |
-| `llama-finetune-grpo` | Phase 3 — GRPO with pluggable reward function |
+**Status:** Working. Phase 1 (QLoRA SFT) and Phase 2 (Reward-Weighted SFT) are implemented and functional. Training speed is currently limited by full backprop through quantized weights — see [Known Limitations](#known-limitations).
 
 ---
 
 ## Build
 
 ```bash
-cmake -B build -DLLAMA_CURL=OFF
+cd /mnt/w/llm-trading-arena/unsloth-api/llama.cpp
+
+# First time (CUDA build):
+cmake -B build -DGGML_CUDA=ON -DBUILD_SHARED_LIBS=ON -DLLAMA_CURL=OFF
+cmake --build build -j$(nproc)
+
+# Incremental rebuild (after code changes):
 cmake --build build --target llama-finetune-qlora -j$(nproc)
+# If llama-adapter.cpp or llama-context.cpp changed, rebuild all:
+cmake --build build -j$(nproc)
 ```
 
 ---
 
 ## Phase 1 — QLoRA SFT (`llama-finetune-qlora`)
 
-Trains LoRA adapters on a quantized GGUF model. The adapter is saved as a GGUF file that can be hot-loaded for inference without merging.
+Trains LoRA adapters on a quantized GGUF model.
 
-### Usage
+### Recommended command (1.7B model, 16 GB card)
 
 ```bash
-llama-finetune-qlora \
-  --model models/llama-3.2-1b-q4_k_m.gguf \
+./build/bin/llama-finetune-qlora \
+  --model ~/qwen3-1.7b-q4_k_m.gguf \
   --train-file data/train.jsonl \
-  --lora-rank 16 \
-  --lora-alpha 16 \
-  --lora-targets "attn_q,attn_k,attn_v,attn_output,ffn_gate,ffn_up,ffn_down" \
-  --lora-out adapter.gguf \
-  -e 3 -c 2048 --seed 42
+  --lora-rank 16 --lora-alpha 16 \
+  -c 4096 -b 4096 -ub 512 \
+  --save-every 10 \
+  --lora-out ~/adapter.gguf \
+  --epochs 3 --seed 42
 ```
 
-### Key flags
+### Recommended command (15B model, 16 GB card, partial offload)
+
+```bash
+./build/bin/llama-finetune-qlora \
+  --model ~/nemotron-15b-q4_k_m.gguf \
+  --train-file data/train.jsonl \
+  --lora-rank 16 --lora-alpha 16 \
+  -ngl 13 -c 14336 -b 14336 -ub 1024 \
+  --save-every 8 \
+  --lora-out ~/nemotron-lora.gguf \
+  --epochs 3 --seed 42
+```
+
+### All flags
 
 | Flag | Default | Description |
 |---|---|---|
 | `--model` | *(required)* | Path to quantized GGUF model |
 | `--train-file` | *(required)* | JSONL training dataset |
-| `--lora-rank` | `16` | LoRA rank (r) |
-| `--lora-alpha` | `0` (= rank) | LoRA alpha; scale = alpha/rank |
-| `--lora-targets` | see below | Comma-separated tensor name substrings to target |
-| `--lora-out` | `adapter.gguf` | Output adapter GGUF path |
-| `-e` / `--epochs` | `3` | Number of training epochs |
-| `-c` / `--ctx-size` | `512` | Training context length |
+| `--lora-rank` | `16` | LoRA rank r |
+| `--lora-alpha` | `0` (= rank) | LoRA alpha; effective scale = alpha/rank |
+| `--lora-targets` | see below | Comma-separated internal tensor name substrings |
+| `--lora-out` | `adapter.gguf` | Output adapter GGUF path (supports `~`) |
+| `--save-every` | `0` | Save checkpoint every N dataset windows (0 = end only) |
+| `--freeze-layers` | `0` | Skip LoRA on first N transformer layers (blk.0..N-1); backward already pruned automatically |
+| `--grad-checkpoint` | `0` | Mark every Nth forward node persistent to reduce activation VRAM; good values: 32–64 |
+| `-epochs` / `--epochs` | `3` | Training epochs |
+| `-c` / `--ctx-size` | `512` | Training context window (tokens) |
+| `-b` / `--batch-size` | `2048` | Tokens per `llama_decode` call; set equal to `-c` |
+| `-ub` / `--ubatch-size` | `512` | GPU micro-batch tokens; controls VRAM vs. step time |
+| `-ngl` | `999` | GPU layers to offload |
+| `-lr` / `--learning-rate` | `1e-4` | AdamW learning rate |
 | `--seed` | `42` | Random seed for LoRA init |
-| `-lr` / `--learning-rate` | `1e-4` | Learning rate |
+
+### VRAM vs. step-time tradeoff
+
+Step time and VRAM both scale linearly with `-ub`:
+
+| Model | `-ub` | VRAM | Step time (approx) |
+|---|---|---|---|
+| 1.7B Q4_K_M | 512 | ~18 GB | ~120 s (OOM on 16 GB) |
+| 1.7B Q4_K_M | 128 | ~6 GB | ~30 s |
+| 15B Q4_K_M | 1024 | ~11 GB | ~60 s |
+
+Use `-c` equal to your target sequence length. More context = more windows per sample = more steps per epoch. Reducing `-c` reduces total training time proportionally.
 
 ### Default LoRA targets
 
 llama.cpp uses **internal GGUF tensor names**, not HuggingFace names:
 
-| llama.cpp internal | HuggingFace equivalent | Layer type |
+| llama.cpp internal | HuggingFace equivalent | Trainable? |
 |---|---|---|
-| `attn_q` | `q_proj` | Attention |
-| `attn_k` | `k_proj` | Attention (**not in default** — see note) |
-| `attn_v` | `v_proj` | Attention (**not in default** — see note) |
-| `attn_output` | `o_proj` | Attention |
-| `ffn_gate` | `gate_proj` | MLP |
-| `ffn_up` | `up_proj` | MLP |
-| `ffn_down` | `down_proj` | MLP |
-| `ssm_in` | `in_proj` | Mamba / NemotronH SSM |
-| `ssm_out` | `out_proj` | Mamba / NemotronH SSM |
+| `attn_q` | `q_proj` | ✅ default |
+| `attn_output` | `o_proj` | ✅ default |
+| `ffn_gate` | `gate_proj` | ✅ default |
+| `ffn_up` | `up_proj` | ✅ default |
+| `ffn_down` | `down_proj` | ✅ default |
+| `attn_k` | `k_proj` | ❌ zero gradient (KV scatter) |
+| `attn_v` | `v_proj` | ❌ zero gradient (KV scatter) |
+| `ssm_in` | `in_proj` | ❌ zero gradient (SSM_SCAN no backward) |
+| `ssm_out` | `out_proj` | ❌ zero gradient (SSM_SCAN no backward) |
 
-Default: `attn_q,attn_output,ffn_gate,ffn_up,ffn_down`
-
-> **Targets excluded from default** — can be added via `--lora-targets` but receive zero gradient:
-> - `attn_k`, `attn_v`: KV cache write uses `ggml_set_rows` (scatter op, no backward). Gradients cannot flow back to LoRA K/V adapters.
-> - `ssm_in`, `ssm_out`: Mamba SSM layers use `SSM_SCAN`/`SSM_CONV` (no backward implementation). LoRA SSM adapters will not learn.
+MoE expert tensors (`*_exps`) are always excluded — they use `MUL_MAT_ID` which has no backward.
 
 ### Dataset format (JSONL)
 
-Three formats are accepted:
-
 **Chat format** (loss on assistant turns only):
 ```json
-{"messages": [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi there!"}]}
+{"messages": [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi!"}]}
 ```
 
-**Prompt/response format** (loss on response only):
+**Prompt/response** (loss on response only):
 ```json
 {"prompt": "What is the capital of France?", "response": "Paris."}
 ```
 
 **Plain text** (loss on all tokens):
 ```json
-{"text": "The quick brown fox jumps over the lazy dog."}
+{"text": "The quick brown fox."}
 ```
 
-### Verify the adapter
-
-```bash
-# Hot-load for inference (no merge needed)
-llama-cli --model models/llama-3.2-1b-q4_k_m.gguf \
-  --lora adapter.gguf -p "Hello"
-
-# Merge adapter into base model
-llama-export-lora \
-  --model models/llama-3.2-1b-q4_k_m.gguf \
-  --lora adapter.gguf \
-  --output merged.gguf
-```
-
----
-
-## Phase 2 — Reward-Weighted SFT (`llama-finetune-rwsft`)
-
-Same as Phase 1 but each sample carries a `reward` field. The cross-entropy loss is scaled by the reward before backprop, so high-quality samples drive larger gradient updates.
-
-### Additional dataset field
-
+**With reward** (Phase 2 — scales gradient by reward):
 ```json
 {"prompt": "...", "response": "...", "reward": 0.85}
 ```
 
-Reward is expected in `[0, 1]`. Samples with `reward=0` produce no gradient.
+Rewards are normalized per epoch: clipped to `[-1, 1]`, then min-max scaled to `[0, 1]`. Reward 0 = sample ignored; reward 1 = full gradient.
 
----
+### Verify and use the adapter
 
-## Phase 3 — GRPO (`llama-finetune-grpo`)
-
-Group Relative Policy Optimization. For each prompt, G responses are sampled from the current policy, scored by a reward function, and the group-normalized advantage drives a REINFORCE-style policy gradient update.
-
-### Reward function
-
-Two modes:
-
-**Embedded stub** (default — edit `reward_fn.cpp` and recompile):
-```cpp
-float compute_reward(const char * prompt, const char * response) {
-    // your scoring logic here
-    return 1.0f;
-}
-```
-
-**Runtime plugin** (`--reward-lib`):
 ```bash
-# Build your reward shared library
-g++ -shared -fPIC -o myreward.so myreward.cpp
+# Hot-load for inference (no merge needed)
+./build/bin/llama-cli --model base.gguf --lora adapter.gguf -p "Hello"
 
-# Pass it at runtime
-llama-finetune-grpo \
-  --model models/base.gguf \
-  --train-file prompts.jsonl \
-  --reward-lib myreward.so \
-  --grpo-group-size 8 \
-  --lora-out grpo_adapter.gguf
+# Merge into base model
+./build/bin/llama-export-lora \
+  --model base.gguf --lora adapter.gguf --output merged.gguf
 ```
-
-The plugin must export:
-```cpp
-extern "C" float compute_reward(const char * prompt, const char * response);
-```
-
-### Additional flags (Phase 3)
-
-| Flag | Default | Description |
-|---|---|---|
-| `--grpo-group-size` | `8` | Number of responses sampled per prompt (G) |
-| `--grpo-temperature` | `0.8` | Sampling temperature for response generation |
-| `--reward-lib` | *(embedded stub)* | Path to shared library implementing `compute_reward` |
 
 ---
 
-## Implementation notes
+## Phase 2 — Reward-Weighted SFT
 
-- **Natural freeze**: quantized tensors (`q4_k`, `q8_0`, etc.) are skipped by `llama_set_param` because they are not `GGML_TYPE_F32`. No explicit freeze logic is needed.
-- **Graph sizing**: the adapter GGUF is pre-saved and registered in `params.lora_adapters` before context creation so `sched_reserve` accounts for the extra LoRA nodes (~4–6 nodes per A/B pair).
-- **No warmup**: `params.warmup = false` is forced — warmup runs inference with PARAM-flagged tensors which causes a segfault.
-- **Adapter compatibility**: saved adapter GGUF uses the metadata format expected by `llama_adapter_lora_init` (`general.type=adapter`, `adapter.type=lora`, `adapter.lora.alpha`).
-- **MoE expert exclusion**: tensors whose names contain `_exps` (e.g. `ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`) are automatically excluded from LoRA targets. They use `ggml_mul_mat_id` (sparse expert dispatch) which has no backward implementation. Dense FFN layers on non-MoE layers are still trainable via `ffn_gate`, `ffn_up`, `ffn_down` targets.
-- **Inplace ops in backward graph**: ggml's backward expander cannot compute gradients through inplace ops (CLAMP, SCALE, SET_ROWS, etc. with `view_src` set). These are silently skipped with a warning — they correspond to side-effect writes (KV cache, MoE weight normalization) that are not part of the loss computation path anyway.
+Built into `llama-finetune-qlora`. When the dataset contains a `reward` or `score` field, the cross-entropy loss for that sample is scaled by the reward before backprop. No extra flags needed — detection is automatic.
+
+---
+
+## Phase 3 — GRPO (planned)
+
+Not yet implemented. Design:
+1. Sample G responses per prompt using current policy
+2. Score each with reward function
+3. Compute group-relative advantage: `A_i = (r_i - mean(r)) / std(r)`
+4. Update policy with REINFORCE loss: `loss = -A_i * log_prob(response_i)`
+
+---
+
+## Known Limitations & Optimization Roadmap
+
+### Current limitations
+
+**1. Full backprop through frozen quantized layers**
+Every backward step dequantizes all frozen Q4_K_M weight tensors to compute activation gradients (needed to propagate loss from the output back to each LoRA layer). For a 28-layer 1.7B model at `-ub 512`, this is ~280 dequantizing matmuls per step → step time is 3–5× slower than inference.
+
+**2. Activation VRAM** *(partially addressed by `--grad-checkpoint`)*
+All forward activations are kept in VRAM throughout the backward pass. VRAM ≈ `model + KV + n_layers × hidden × n_ubatch × 10 × 4B + 2 × lora_params × 4B`. Reducing `-ub` reduces VRAM linearly. Use `--grad-checkpoint 48` to prevent the allocator from reusing intermediate activation buffers during backward, which cuts peak activation VRAM at near-zero compute cost.
+
+**3. Full backprop through all layers** *(partially addressed by `--freeze-layers`)*
+Gradients propagate through all layers that have LoRA adapters. Use `--freeze-layers N` to skip LoRA allocation for blk.0..N-1 — those layers receive no gradient (the `grads_needed` pruner already skips their backward ops automatically). Only the top (total_layers - N) layers are trained.
+
+### Optimization roadmap
+
+| Priority | Optimization | Expected gain | Status |
+|---|---|---|---|
+| ✅ Done | **`--freeze-layers N`** — no LoRA on first N layers; backward auto-pruned | Proportional to N/total | Implemented |
+| ✅ Done | **`--grad-checkpoint N`** — keep every Nth activation alive through backward | Reduces peak activation VRAM | Implemented |
+| Medium | **Static training graphs** — build backward graph once, reuse every ubatch | Eliminate ~0.5 s/step overhead | Planned |
+| Medium | **`MUL_MAT_ID` backward** — enable LoRA on MoE expert layers | Unlocks Mixtral/Qwen-MoE | Planned |
+| Low | **`SSM_SCAN/CONV` backward** — enable LoRA on Mamba SSM layers | Unlocks NemotronH SSM layers | Planned |
+
+---
+
+## Implementation notes (for developers)
+
+### Modified llama.cpp files
+
+| File | Change |
+|---|---|
+| `ggml/src/ggml.c` | Backward graph fixes: `GET_ROWS` 3D, `SET_ROWS`, `MUL_MAT_ID`, `SSM_SCAN/CONV`, `FLASH_ATTN_EXT` all stop gradient; inplace-op assert → warn+skip |
+| `src/llama-context.cpp` | `opt_init`: scheduler and graph sized with inflated capacity before `ggml_opt_init`; `opt_epoch_iter`: per-ubatch timing instrumentation; reward scaling via `g_reward_weights` TLS |
+| `src/llama-adapter.cpp` | Repack-buft fallback for LoRA tensors: tries device-native buft before CPU |
+| `common/common.h` | Added `save_every`, `lora_freeze_layers`, `grad_checkpoint_interval` fields |
+| `common/arg.cpp` | Added `--save-every`, `--freeze-layers`, `--grad-checkpoint` arguments |
+| `include/llama.h` | Added `llama_opt_set_reward_weights()`; `grad_checkpoint_interval` in `llama_opt_params` |
+| `ggml/include/ggml-opt.h` | Added `grad_checkpoint_interval` to `ggml_opt_params` |
+| `ggml/src/ggml-opt.cpp` | Gradient checkpointing: marks every Nth forward node `GGML_TENSOR_FLAG_OUTPUT` before backward build |
+
+### Key invariants
+
+- `params.use_mmap = false` — forced; mmap'd tensors can't have data written back
+- `params.flash_attn_type = DISABLED` — no backward impl for flash attention
+- `params.warmup = false` — warmup runs inference with PARAM tensors → segfault
+- `params.cache_type_k = F32` — training requires F32 KV (or BF16 with `--cache-type-k bf16`)
+- LoRA A/B tensors are marked `PARAM` via `ggml_set_param` on the tensors loaded by `llama_adapter_lora_init`, not on the pre-init scratch tensors in `lt.buf`
+- The adapter GGUF is pre-saved and loaded via `params.lora_adapters` BEFORE `common_init_from_params` so that `sched_reserve` includes LoRA graph nodes in its sizing
+
+### Why opt_init inflation matters
+
+`ggml_opt_init` captures `sched.get()` at construction time. The backward graph (`gb_grad`, `gb_opt`) is ~3–5× larger than the forward graph in node count. If the scheduler hash_set is sized only for the forward graph, `ggml_backend_sched_alloc_graph` on the backward graph will overflow it. We recreate `sched` with `inflated = fwd_nodes × 4` slots BEFORE calling `ggml_opt_init`.
+
+### Reward weighting implementation
+
+`llama_opt_set_reward_weights(weights, n)` sets thread-local `g_reward_weights`. In `opt_epoch`, each window reads `g_reward_weights[idata]` and passes it as `reward_scale` to `opt_epoch_iter`. Inside the iter loop, instead of writing `1.0f` for the correct token's label position in the cross-entropy label tensor, it writes `reward_scale`. Since cross-entropy loss = `-mean(label × log(softmax(logit)))`, scaling the label scales both loss and gradient identically.

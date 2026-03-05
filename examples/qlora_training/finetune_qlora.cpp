@@ -13,7 +13,7 @@
          --lora-rank 16 --lora-alpha 16 \
          --lora-targets "attn_q,attn_output,ffn_gate,ffn_up,ffn_down,ssm_in,ssm_out" \
          --lora-out adapter.gguf \
-         -e 3 -c 512
+         --epochs 3 -c 512
 */    
 // NOTE: attn_k and attn_v are excluded from the default targets.  The KV write path uses
 // ggml_set_rows (a scatter op with view_src set) and the backward graph cannot propagate
@@ -99,8 +99,26 @@ static bool tensor_is_excluded(const char * name) {
     return false;
 }
 
-static bool tensor_matches_targets(const char * name, const std::vector<std::string> & targets) {
+// Extract the transformer block index from a tensor name of the form "blk.NN.<rest>".
+// Returns -1 if the name does not follow this pattern.
+static int tensor_layer_index(const char * name) {
+    // All per-layer tensors in llama.cpp GGUF are named "blk.<N>.<suffix>"
+    const char * p = strstr(name, "blk.");
+    if (!p) return -1;
+    p += 4; // skip "blk."
+    char * end = nullptr;
+    long idx = strtol(p, &end, 10);
+    if (end == p || (*end != '.' && *end != '\0')) return -1;
+    return (int) idx;
+}
+
+static bool tensor_matches_targets(const char * name, const std::vector<std::string> & targets,
+                                   int freeze_layers = 0) {
     if (tensor_is_excluded(name)) return false;
+    if (freeze_layers > 0) {
+        const int layer = tensor_layer_index(name);
+        if (layer >= 0 && layer < freeze_layers) return false;
+    }
     for (const auto & t : targets) {
         if (std::string(name).find(t) != std::string::npos) return true;
     }
@@ -315,7 +333,8 @@ static lora_tensors alloc_lora_tensors(
         const std::string        & model_path,
         const std::vector<std::string> & targets,
         int32_t                   rank,
-        std::mt19937            & rng) {
+        std::mt19937            & rng,
+        int32_t                   freeze_layers = 0) {
 
     lora_tensors lt;
 
@@ -337,7 +356,7 @@ static lora_tensors alloc_lora_tensors(
     for (ggml_tensor * t = ggml_get_first_tensor(ctx_meta);
          t; t = ggml_get_next_tensor(ctx_meta, t)) {
         if (ggml_n_dims(t) < 2) continue;
-        if (!tensor_matches_targets(t->name, targets)) continue;
+        if (!tensor_matches_targets(t->name, targets, freeze_layers)) continue;
         matched.push_back({t->name, t->ne[0], t->ne[1]});
     }
 
@@ -349,6 +368,10 @@ static lora_tensors alloc_lora_tensors(
         return lt;
     }
 
+    if (freeze_layers > 0) {
+        LOG_INF("%s: freezing layers blk.0 .. blk.%d (no LoRA allocated; backward already pruned by grads_needed)\n",
+                __func__, freeze_layers - 1);
+    }
     LOG_INF("%s: allocating LoRA A/B tensors for %zu weight matrices, rank=%d\n",
             __func__, matched.size(), rank);
 
@@ -559,22 +582,32 @@ int main(int argc, char ** argv) {
     }
 
     // --- Step 2: Allocate LoRA tensors and save initial adapter GGUF ---
-    // The initial adapter (B=zeros, A=random) must exist on disk BEFORE context
-    // creation so that common_init_from_params loads it via params.lora_adapters.
-    // This causes sched_reserve to size the graph to include LoRA nodes, preventing
-    // the cgraph overflow that occurs when the adapter is activated post-init.
+    // If the user already supplied a --lora adapter we reuse it (resume training).
+    // Otherwise we allocate fresh tensors (B=0, A=random), write them to a temp
+    // .init.gguf so common_init_from_params can load them before context creation
+    // (this makes sched_reserve size the graph to include LoRA nodes).
+    const bool resume_from_lora = !params.lora_adapters.empty();
+
     std::mt19937 rng(42);
-    auto lt = alloc_lora_tensors(params.model.path, targets, params.lora_rank, rng);
-    if (lt.ab.empty()) return 1;
+    lora_tensors lt; // will be populated after context load (Step 4)
+    std::string init_adapter_path;
 
-    const std::string init_adapter_path = params.lora_out + ".init.gguf";
-    save_adapter(lt, init_adapter_path, arch, lora_alpha);
+    if (!resume_from_lora) {
+        lt = alloc_lora_tensors(params.model.path, targets, params.lora_rank, rng, params.lora_freeze_layers);
+        if (lt.ab.empty()) return 1;
 
-    // Register adapter so common_init_from_params loads it before context creation
-    common_adapter_lora_info adapter_info;
-    adapter_info.path  = init_adapter_path;
-    adapter_info.scale = 1.0f;
-    params.lora_adapters.push_back(adapter_info);
+        init_adapter_path = params.lora_out + ".init.gguf";
+        save_adapter(lt, init_adapter_path, arch, lora_alpha);
+
+        // Register adapter so common_init_from_params loads it before context creation
+        common_adapter_lora_info adapter_info;
+        adapter_info.path  = init_adapter_path;
+        adapter_info.scale = 1.0f;
+        params.lora_adapters.push_back(adapter_info);
+    } else {
+        LOG_INF("%s: resuming training from existing LoRA adapter: %s\n",
+                __func__, params.lora_adapters.back().path.c_str());
+    }
 
     // --- Step 3: Load model + context (graph sized with LoRA nodes) ---
     common_init();
@@ -611,7 +644,7 @@ int main(int argc, char ** argv) {
             ggml_set_param(kv.second.a);  // lora_a → trainable
             ggml_set_param(kv.second.b);  // lora_b → trainable
         }
-        // Update lt.ab to point to the loaded tensors so save_adapter writes
+        // Point lt.ab at the live device tensors so save_adapter writes
         // the trained weights (not the original init tensors).
         lt.ab.clear();
         for (auto & kv : loaded->ab_map) {
@@ -619,8 +652,10 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // Remove init file (no longer needed; final save uses params.lora_out)
-    std::remove(init_adapter_path.c_str());
+    // Remove temp init file when we created it (resume path has no init file)
+    if (!resume_from_lora && !init_adapter_path.empty()) {
+        std::remove(expand_tilde(init_adapter_path).c_str());
+    }
 
     // --- Step 5: Load dataset ---
     auto tmpls = common_chat_templates_init(model, "");
@@ -645,12 +680,13 @@ int main(int argc, char ** argv) {
 
     // Initialize optimizer — our custom param filter restricts training to lora_a/b
     struct llama_opt_params lopt_params {
-        /*.n_ctx_train     =*/0,
-        /*.param_filter    =*/lora_param_filter,
-        /*.param_filter_ud =*/nullptr,
-        /*.get_opt_pars    =*/common_opt_lr_pars,
-        /*.get_opt_pars_ud =*/&params.lr,
-        /*.optimizer_type  =*/params.optimizer,
+        /*.n_ctx_train              =*/0,
+        /*.param_filter             =*/lora_param_filter,
+        /*.param_filter_ud          =*/nullptr,
+        /*.get_opt_pars             =*/common_opt_lr_pars,
+        /*.get_opt_pars_ud          =*/&params.lr,
+        /*.optimizer_type           =*/params.optimizer,
+        /*.grad_checkpoint_interval =*/params.grad_checkpoint_interval,
     };
     llama_opt_init(ctx, model, lopt_params);
 
@@ -697,8 +733,9 @@ int main(int argc, char ** argv) {
     // Save final trained adapter
     save_adapter(lt, params.lora_out, arch, lora_alpha);
 
-    ggml_backend_buffer_free(lt.buf);
-    ggml_free(lt.ctx);
+    // Free scratch buffers only when we allocated them (not in resume path)
+    if (lt.buf) ggml_backend_buffer_free(lt.buf);
+    if (lt.ctx) ggml_free(lt.ctx);
     ggml_opt_dataset_free(dataset);
     llama_backend_free();
 
