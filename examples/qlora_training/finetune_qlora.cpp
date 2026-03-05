@@ -275,6 +275,28 @@ static ggml_opt_dataset_t build_dataset(
         window_rewards[i] = reward_sum / n_ctx;
     }
 
+    // Normalize window rewards to [0, 1].
+    // Step 1: clip to [-1, 1] — outliers like 1.3/1.4 would otherwise compress the
+    //         useful signal range after min-max scaling (a reward=1.0 would map to
+    //         only 0.83 instead of 1.0 if the max is 1.4).
+    // Step 2: min-max scale clipped values → [0, 1].
+    //         min → 0.0 (window ignored), max → 1.0 (full weight).
+    // If all rewards are identical (pure SFT dataset) keep at 1.0.
+    for (float & r : window_rewards) {
+        r = std::max(-1.0f, std::min(1.0f, r));
+    }
+    float rmin = *std::min_element(window_rewards.begin(), window_rewards.end());
+    float rmax = *std::max_element(window_rewards.begin(), window_rewards.end());
+    const float rrange = rmax - rmin;
+    if (rrange > 1e-6f) {
+        for (float & r : window_rewards) {
+            r = (r - rmin) / rrange;
+        }
+        LOG_INF("%s: reward range [%.4f, %.4f] (after clip to [-1,1]) → normalized to [0, 1]\n", __func__, rmin, rmax);
+    } else {
+        std::fill(window_rewards.begin(), window_rewards.end(), 1.0f);
+    }
+
     return dataset;
 }
 
@@ -618,7 +640,7 @@ int main(int argc, char ** argv) {
                                          [](float r){ return std::abs(r - 1.0f) > 1e-4f; });
     if (has_rewards) {
         LOG_INF("%s: reward-weighted SFT enabled (found non-uniform rewards in dataset)\n", __func__);
-        llama_opt_set_reward_weights(&window_rewards);
+        llama_opt_set_reward_weights(window_rewards.data(), (int64_t)window_rewards.size());
     }
 
     // Initialize optimizer — our custom param filter restricts training to lora_a/b
@@ -670,7 +692,7 @@ int main(int argc, char ** argv) {
 
     ggml_opt_result_free(result_train);
     ggml_opt_result_free(result_eval);
-    llama_opt_set_reward_weights(nullptr);
+    llama_opt_set_reward_weights(nullptr, 0);
 
     // Save final trained adapter
     save_adapter(lt, params.lora_out, arch, lora_alpha);

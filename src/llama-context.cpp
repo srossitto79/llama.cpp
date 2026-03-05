@@ -2740,11 +2740,13 @@ void llama_context::opt_epoch_iter(
 
 // Optional per-window reward weights for reward-weighted SFT.
 // Set via llama_opt_set_reward_weights() before calling llama_opt_epoch().
-// Null means all rewards are 1.0 (standard SFT).
-static thread_local const std::vector<float> * g_reward_weights = nullptr;
+// Null/0 means all rewards are 1.0 (standard SFT).
+static thread_local const float * g_reward_weights    = nullptr;
+static thread_local int64_t       g_reward_weights_n  = 0;
 
-void llama_opt_set_reward_weights(const std::vector<float> * weights) {
-    g_reward_weights = weights;
+void llama_opt_set_reward_weights(const float * weights, int64_t n_weights) {
+    g_reward_weights   = weights;
+    g_reward_weights_n = n_weights;
 }
 
 void llama_context::opt_epoch(
@@ -2775,8 +2777,8 @@ void llama_context::opt_epoch(
     for (; idata < idata_split; ++idata) {
         constexpr bool train = true;
         const int64_t idata_in_loop = idata*ubatch_per_ctx;
-        const float reward = (g_reward_weights && idata < (int64_t)g_reward_weights->size())
-                             ? (*g_reward_weights)[idata] : 1.0f;
+        const float reward = (g_reward_weights && idata < g_reward_weights_n)
+                             ? g_reward_weights[idata] : 1.0f;
 
         ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
         opt_epoch_iter(dataset, result_train, tokens, labels_sparse, batch, reward,

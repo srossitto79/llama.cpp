@@ -1545,10 +1545,11 @@ extern "C" {
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
 
     // Optional: set per-window reward weights for reward-weighted SFT.
-    // Pass a pointer to a vector of floats (one per dataset window, indexed by idata).
-    // Pass nullptr to disable (equivalent to all-ones, i.e. standard SFT).
-    // Must be called before llama_opt_epoch. Pointer must remain valid for the duration of the epoch.
-    LLAMA_API void llama_opt_set_reward_weights(const std::vector<float> * weights);
+    // weights: array of floats, one per dataset window (indexed by idata), already normalized to [0,1].
+    // n_weights: length of the array.
+    // Pass NULL/0 to disable (equivalent to all-ones, i.e. standard SFT).
+    // The pointer must remain valid for the duration of all llama_opt_epoch calls.
+    LLAMA_API void llama_opt_set_reward_weights(const float * weights, int64_t n_weights);
 
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,
