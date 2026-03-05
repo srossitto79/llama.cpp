@@ -6467,6 +6467,37 @@ static void ggml_compute_backward(
                                 grad)));        // [m,p,qq,rr]
             }
         } break;
+        case GGML_OP_MUL_MAT_ID: {
+            // as  -> src0: [cols, rows, n_expert]   (quantized expert weights, frozen)
+            // b   -> src1: [cols, n_expert_used, n_tokens]  (activations, F32)
+            // ids -> src2: [n_expert_used, n_tokens] (i32)
+            // c   -> result: [rows, n_expert_used, n_tokens]
+            //
+            // grad_b[col, e, t] = sum_r as[col, r, ids[e,t]] * grad[r, e, t]
+            //                   = ggml_mul_mat_id(as_T, grad, ids)
+            //   where as_T = cont(permute(as_f32, 1,0,2,3)) is [rows, cols, n_expert] F32
+            //
+            // We cast src0 to F32 first so that the permute+cont can run on GPU.
+            // grad_src0 (expert weight gradient) is not implemented — expert weights are
+            // quantized and frozen; only the LoRA adapters wrapping them are trained.
+            if (src1_needs_grads) {
+                struct ggml_tensor * src0_f32 = ggml_cast(ctx,
+                    (struct ggml_tensor *) src0, GGML_TYPE_F32);
+                struct ggml_tensor * src0_T = ggml_cont(ctx,
+                    ggml_permute(ctx, src0_f32, 1, 0, 2, 3));
+                struct ggml_tensor * grad_src1 =
+                    ggml_mul_mat_id(ctx, src0_T, grad, (struct ggml_tensor *) src2);
+                // src1 may be broadcast over the n_expert_used dim (ne[1]=1).
+                // Reduce the gradient back to src1's shape via repeat_back.
+                if (!ggml_are_same_shape(grad_src1, (const struct ggml_tensor *) src1)) {
+                    grad_src1 = ggml_repeat_back(ctx, grad_src1, (struct ggml_tensor *) src1);
+                }
+                ggml_add_or_set(ctx, cgraph, isrc1, grad_src1);
+            }
+            if (src0_needs_grads) {
+                GGML_ABORT("MUL_MAT_ID grad_src0 not yet implemented");
+            }
+        } break;
         case GGML_OP_SCALE: {
             if (src0_needs_grads) {
                 float s;
@@ -6935,9 +6966,19 @@ void ggml_build_backward_expand(
                 ignore_src[2] = true;
                 break;
 
+            // MUL_MAT_ID: sparse MoE expert dispatch.
+            // src0 (expert weights) is always quantized/frozen → stop grad.
+            // src1 (activations) grad is implemented via ggml_mul_mat_id(permute(src0), grad, ids).
+            // src2 (ids) and src3 are always integer/ignored.
+            case GGML_OP_MUL_MAT_ID:
+                ignore_src[0] = true;  // expert weights — quantized, frozen
+                // ignore_src[1] left false — activation gradient flows through
+                ignore_src[2] = true;  // ids (i32)
+                ignore_src[3] = true;
+                break;
+
             // Ops with no backward implementation — stop gradient propagation through all
             // their sources so the backward graph builder never tries to compute a gradient.
-            case GGML_OP_MUL_MAT_ID:    // sparse MoE expert dispatch
             case GGML_OP_SSM_SCAN:      // Mamba2 selective-scan (state update + output)
             case GGML_OP_SSM_CONV:      // Mamba2 causal conv1d over SSM state
             case GGML_OP_FLASH_ATTN_EXT: // flash attention has no backward; use standard attn for training

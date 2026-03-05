@@ -96,8 +96,8 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         const size_t s2  = nb2  / sizeof(float);
         const size_t s3  = nb3  / sizeof(float);
 
-        const int64_t lda = ne00;  // dequantized slice is column-major [ne00, ne01]
-        const int64_t ldc = ne00;  // dst slice is [ne00, ne10]
+        const int64_t lda = ne00;  // dequantized slice is always contiguous: col-major [ne00, ne01]
+        const int64_t ldc = nb1 / sizeof(float);  // dst leading dim — matches F32 path
 
         const char * src0_base = (const char *) src0->data;
 
