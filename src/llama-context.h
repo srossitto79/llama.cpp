@@ -195,6 +195,7 @@ struct llama_context {
             const std::vector<llama_token> & tokens,
             const std::vector<llama_token> & labels_sparse,
             llama_batch                    & batch,
+            float                            reward_scale,
             ggml_opt_epoch_callback          callback,
             bool                             train,
             int64_t                          idata_in_loop,

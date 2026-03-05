@@ -64,6 +64,17 @@
 // Helpers
 // ---------------------------------------------------------------------------
 
+// Expand a leading ~/ to the HOME directory (the shell doesn't do this for us
+// when a path is passed as a string argument to std::ofstream).
+static std::string expand_tilde(const std::string & path) {
+    if (path.size() >= 2 && path[0] == '~' && path[1] == '/') {
+        const char * home = getenv("HOME");
+        if (!home) home = getenv("USERPROFILE"); // Windows fallback
+        if (home) return std::string(home) + path.substr(1);
+    }
+    return path;
+}
+
 static std::vector<std::string> split_csv(const std::string & s) {
     std::vector<std::string> out;
     std::istringstream ss(s);
@@ -103,6 +114,7 @@ static bool tensor_matches_targets(const char * name, const std::vector<std::str
 struct training_sample {
     std::vector<llama_token> tokens;   // full token sequence
     std::vector<bool>        is_label; // true for tokens that contribute to loss
+    float                    reward;   // reward/score weight (1.0 = neutral, 0.0 = ignore)
 };
 
 // Apply a very simple ChatML fallback template when the model has no template.
@@ -148,6 +160,10 @@ static std::vector<training_sample> load_jsonl(
             continue;
         }
 
+        float reward = 1.0f;
+        if      (j.contains("reward")) reward = j["reward"].get<float>();
+        else if (j.contains("score"))  reward = j["score"].get<float>();
+
         std::string prompt_text;
         std::string response_text;
 
@@ -191,6 +207,7 @@ static std::vector<training_sample> load_jsonl(
         if (tok_prompt.empty() && tok_response.empty()) continue;
 
         training_sample s;
+        s.reward = reward;
         s.tokens.insert(s.tokens.end(), tok_prompt.begin(),   tok_prompt.end());
         s.tokens.insert(s.tokens.end(), tok_response.begin(), tok_response.end());
         s.is_label.resize(s.tokens.size(), false);
@@ -208,18 +225,24 @@ static std::vector<training_sample> load_jsonl(
 // Pack variable-length samples into fixed-context-length windows and create
 // an ggml_opt_dataset. Labels for prompt tokens are set to -1 (ignored by
 // the loss in the epoch loop).
+// window_rewards is filled with one reward weight per window (averaged over
+// the sample tokens that fall in that window). If all samples have reward=1.0
+// the vector is all-ones and has no effect.
 static ggml_opt_dataset_t build_dataset(
         const std::vector<training_sample> & samples,
-        int32_t n_ctx) {
+        int32_t                              n_ctx,
+        std::vector<float>                 & window_rewards) {
 
-    // Flatten samples separated by EOS (-1 acts as pad) into context windows
+    // Flatten samples into token/label/reward streams
     std::vector<llama_token> flat_tokens;
-    std::vector<int32_t>     flat_labels; // -1 = no loss, token_id = loss target
+    std::vector<int32_t>     flat_labels;  // -1 = no loss, token_id = loss target
+    std::vector<float>       flat_rewards; // per-token reward from the source sample
 
     for (const auto & s : samples) {
         for (size_t i = 0; i + 1 < s.tokens.size(); ++i) {
-            flat_tokens.push_back(s.tokens[i]);
-            flat_labels.push_back(s.is_label[i + 1] ? (int32_t)s.tokens[i + 1] : -1);
+            flat_tokens .push_back(s.tokens[i]);
+            flat_labels .push_back(s.is_label[i + 1] ? (int32_t)s.tokens[i + 1] : -1);
+            flat_rewards.push_back(s.reward);
         }
     }
 
@@ -232,8 +255,8 @@ static ggml_opt_dataset_t build_dataset(
     const int64_t stride = n_ctx / 2;
     const int64_t ndata  = ((int64_t)flat_tokens.size() - n_ctx) / stride;
 
-    // data:   input token ids  [n_ctx, ndata]
-    // labels: target token ids [n_ctx, ndata], -1 → mask (we use 0 but ignore via is_label)
+    window_rewards.resize(ndata);
+
     ggml_opt_dataset_t dataset = ggml_opt_dataset_init(
             GGML_TYPE_I32, GGML_TYPE_I32, n_ctx, n_ctx, ndata, 1);
 
@@ -242,12 +265,14 @@ static ggml_opt_dataset_t build_dataset(
 
     for (int64_t i = 0; i < ndata; ++i) {
         const int64_t off = i * stride;
+        float reward_sum = 0.0f;
         for (int32_t j = 0; j < n_ctx; ++j) {
             data  [i * n_ctx + j] = flat_tokens[off + j];
-            // label at position j is the next token; -1 means no loss
             int32_t lbl = flat_labels[off + j];
             labels[i * n_ctx + j] = (lbl < 0) ? flat_tokens[off + j] : lbl;
+            reward_sum += flat_rewards[off + j];
         }
+        window_rewards[i] = reward_sum / n_ctx;
     }
 
     return dataset;
@@ -387,9 +412,10 @@ static void save_adapter(
     }
 
     // Write: meta placeholder → tensor data → rewrite meta
-    std::ofstream fout(out_path, std::ios::binary);
+    const std::string real_path = expand_tilde(out_path);
+    std::ofstream fout(real_path, std::ios::binary);
     if (!fout.is_open()) {
-        LOG_ERR("%s: cannot open %s for writing\n", __func__, out_path.c_str());
+        LOG_ERR("%s: cannot open %s for writing\n", __func__, real_path.c_str());
         gguf_free(gctx);
         return;
     }
@@ -424,7 +450,44 @@ static void save_adapter(
     fout.close();
     gguf_free(gctx);
 
-    LOG_INF("%s: adapter saved to %s\n", __func__, out_path.c_str());
+    LOG_INF("%s: adapter saved to %s\n", __func__, real_path.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Periodic checkpoint callback
+// ---------------------------------------------------------------------------
+
+struct save_ctx {
+    const lora_tensors * lt;
+    const std::string  * lora_out;
+    const std::string  * arch;
+    float                lora_alpha;
+    int32_t              save_every;     // 0 = disabled
+    int32_t              ubatch_per_ctx;
+    int64_t              last_saved;     // last window index at which we saved
+};
+
+// TLS pointer set before each epoch so the static callback can access it.
+static thread_local save_ctx * g_save_ctx = nullptr;
+
+static void save_every_callback(
+        bool               train,
+        ggml_opt_context_t opt_ctx,
+        ggml_opt_dataset_t dataset,
+        ggml_opt_result_t  result,
+        int64_t            ibatch,
+        int64_t            ibatch_max,
+        int64_t            t_start_us) {
+    ggml_opt_epoch_callback_progress_bar(train, opt_ctx, dataset, result, ibatch, ibatch_max, t_start_us);
+    if (!train || !g_save_ctx || g_save_ctx->save_every <= 0) return;
+    const int64_t window = ibatch / g_save_ctx->ubatch_per_ctx;
+    if (window > 0 && window != g_save_ctx->last_saved && window % g_save_ctx->save_every == 0) {
+        g_save_ctx->last_saved = window;
+        const std::string ckpt = *g_save_ctx->lora_out + ".ckpt" + std::to_string(window) + ".gguf";
+        save_adapter(*g_save_ctx->lt, ckpt, *g_save_ctx->arch, g_save_ctx->lora_alpha);
+        fprintf(stderr, "\n");
+        LOG_INF("save_every_callback: checkpoint saved -> %s (window %ld)\n", ckpt.c_str(), (long)window);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -546,8 +609,17 @@ int main(int argc, char ** argv) {
     }
 
     const int32_t n_ctx = llama_n_ctx(ctx);
-    auto dataset = build_dataset(samples, n_ctx);
+    std::vector<float> window_rewards;
+    auto dataset = build_dataset(samples, n_ctx, window_rewards);
     if (!dataset) return 1;
+
+    // Check if any reward deviates from 1.0 — if so, enable reward-weighted SFT
+    const bool has_rewards = std::any_of(window_rewards.begin(), window_rewards.end(),
+                                         [](float r){ return std::abs(r - 1.0f) > 1e-4f; });
+    if (has_rewards) {
+        LOG_INF("%s: reward-weighted SFT enabled (found non-uniform rewards in dataset)\n", __func__);
+        llama_opt_set_reward_weights(&window_rewards);
+    }
 
     // Initialize optimizer — our custom param filter restricts training to lora_a/b
     struct llama_opt_params lopt_params {
@@ -565,12 +637,31 @@ int main(int argc, char ** argv) {
     ggml_opt_result_t result_train = ggml_opt_result_init();
     ggml_opt_result_t result_eval  = ggml_opt_result_init();
 
+    const int32_t n_ubatch       = llama_n_ubatch(ctx);
+    const int32_t ubatch_per_ctx = (n_ubatch > 0) ? (n_ctx / n_ubatch) : 1;
+
+    save_ctx sctx { &lt, &params.lora_out, &arch, lora_alpha, params.save_every, ubatch_per_ctx, 0 };
+    g_save_ctx = &sctx;
+
+    const int64_t total_windows = ggml_opt_dataset_ndata(dataset);
     LOG_INF("%s: starting QLoRA training — rank=%d alpha=%.1f epochs=%d\n",
             __func__, params.lora_rank, lora_alpha, params.lr.epochs);
+    LOG_INF("%s: dataset: %ld windows × %d ubatches = %ld steps per epoch  (n_ctx=%d n_ubatch=%d stride=%d)\n",
+            __func__, (long)total_windows, ubatch_per_ctx, (long)(idata_split * ubatch_per_ctx),
+            n_ctx, n_ubatch, n_ctx / 2);
+    if (params.save_every > 0) {
+        LOG_INF("%s: will save checkpoint every %d windows → %s.ckptN.gguf\n",
+                __func__, params.save_every, params.lora_out.c_str());
+    }
+
+    ggml_opt_epoch_callback cb_train = (params.save_every > 0)
+        ? save_every_callback
+        : ggml_opt_epoch_callback_progress_bar;
 
     for (params.lr.epoch = 0; params.lr.epoch < params.lr.epochs; ++params.lr.epoch) {
+        sctx.last_saved = 0;  // reset per-epoch window counter
         llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split,
-                        ggml_opt_epoch_callback_progress_bar,
+                        cb_train,
                         ggml_opt_epoch_callback_progress_bar);
         fprintf(stderr, "\n");
         ggml_opt_result_reset(result_train);
@@ -579,6 +670,7 @@ int main(int argc, char ** argv) {
 
     ggml_opt_result_free(result_train);
     ggml_opt_result_free(result_eval);
+    llama_opt_set_reward_weights(nullptr);
 
     // Save final trained adapter
     save_adapter(lt, params.lora_out, arch, lora_alpha);

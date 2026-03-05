@@ -524,6 +524,7 @@ struct common_params {
     std::string lora_targets   = "attn_q,attn_output,ffn_gate,ffn_up,ffn_down"; // comma-separated substrings to match trainable tensors
     std::string lora_out       = "adapter.gguf";  // output adapter GGUF path
     std::string train_file     = "";              // JSONL training dataset path
+    int32_t     save_every     = 0;               // save adapter every N dataset windows (0 = only at end)
 
     // embedding
     bool embedding         = false; // get only sentence embedding
