@@ -70,7 +70,7 @@ echo ""
     -b 16384 \
     -ub 512 \
     --ppl-stride 8192 \
-    -ngl 0 \
+    -ngl 99 \
     -t "$(nproc)"
 
 if [[ -n "$TMPFILE" ]]; then

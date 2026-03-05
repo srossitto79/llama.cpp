@@ -4626,7 +4626,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 }
             } break;
         case GGML_OP_OUT_PROD:
-            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+            // F32 src0: cuBLAS Sgemm directly.
+            // Quantized src0 + F32 src1: dequantize on GPU then cuBLAS — enables
+            // backward of MUL_MAT(quantized_weight, x) to run on GPU (not CPU fallback).
+            return op->type == GGML_TYPE_F32
+                && (op->src[0]->type == GGML_TYPE_F32 || (ggml_is_quantized(op->src[0]->type) && ggml_get_to_fp32_cuda(op->src[0]->type) != nullptr))
+                && op->src[1]->type == GGML_TYPE_F32
+                && op->src[0]->nb[0] == ggml_type_size(op->src[0]->type)  // src0 not transposed (required)
+                && !ggml_is_transposed(op->src[0]);
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
