@@ -241,8 +241,8 @@ static std::vector<training_sample> load_jsonl(
 }
 
 // Pack variable-length samples into fixed-context-length windows and create
-// an ggml_opt_dataset.  All positions use the correct next-token label;
-// prompt and response tokens are treated identically in the loss.
+// an ggml_opt_dataset. Labels for prompt tokens are set to -1 (ignored by
+// the loss in the epoch loop).
 // window_rewards is filled with one reward weight per window (averaged over
 // the sample tokens that fall in that window). If all samples have reward=1.0
 // the vector is all-ones and has no effect.
@@ -256,14 +256,25 @@ static ggml_opt_dataset_t build_dataset(
     std::vector<int32_t>     flat_labels;  // -1 = no loss, token_id = loss target
     std::vector<float>       flat_rewards; // per-token reward from the source sample
 
+    // LABEL_FIX toggle:
+    //   false (default) = prompt positions get label = current input token (original behavior,
+    //                     known to work — gradient is small because the model already "knows"
+    //                     the current token from context).
+    //   true            = prompt positions get the correct next-token label (theoretically
+    //                     correct, but adds loss on ALL positions which can overwhelm small
+    //                     datasets — test carefully before enabling).
+    constexpr bool LABEL_FIX = true;
+
     for (const auto & s : samples) {
         for (size_t i = 0; i + 1 < s.tokens.size(); ++i) {
             flat_tokens .push_back(s.tokens[i]);
-            // Always store the correct next-token label.  Prompt positions
-            // (is_label[i+1]==false) used to store -1, which was later replaced
-            // with the *current* input token — that's the WRONG target and trains
-            // the model to repeat the last token, corrupting it over time.
-            flat_labels .push_back((int32_t)s.tokens[i + 1]);
+            if (LABEL_FIX) {
+                // All positions get correct next-token label
+                flat_labels.push_back((int32_t)s.tokens[i + 1]);
+            } else {
+                // Prompt positions get -1 (replaced with current token below)
+                flat_labels.push_back(s.is_label[i + 1] ? (int32_t)s.tokens[i + 1] : -1);
+            }
             flat_rewards.push_back(s.reward);
         }
     }
@@ -290,7 +301,8 @@ static ggml_opt_dataset_t build_dataset(
         float reward_sum = 0.0f;
         for (int32_t j = 0; j < n_ctx; ++j) {
             data  [i * n_ctx + j] = flat_tokens[off + j];
-            labels[i * n_ctx + j] = flat_labels[off + j];
+            int32_t lbl = flat_labels[off + j];
+            labels[i * n_ctx + j] = (lbl < 0) ? flat_tokens[off + j] : lbl;
             reward_sum += flat_rewards[off + j];
         }
         window_rewards[i] = reward_sum / n_ctx;

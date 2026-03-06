@@ -2,9 +2,9 @@ sross@TURISTATION:~/repos/llm-trading-arena/unsloth-api/llama.cpp/build/bin$ ./l
 
 ./llama-finetune-qlora --model ~/nemotron-3-trader-15b-Q4_K_M.gguf --train-file ~/repos/llm-trading-arena/unsloth-api/llama.cpp/tools/moe-pruning/training-data.jsonl -t 24 --lora-rank 64 --lora-alpha 128 -c 14336 --save-every 10 --lora-out ~/nemotron-3-trader-15b-lora.gguf -ngl 13 -ub 512 --grad-clip 1.0
 
-./llama-finetune-qlora --model ~/nemotron-3-trader-15b-Q4_K_M.gguf --train-file ~/repos/llm-trading-arena/unsloth-api/llama.cpp/tools/moe-pruning/rwsft-training-data.jsonl -t 24 --lora-rank 128 --lora-alpha 256 -c 14336 --save-every 1 --lora-out ~/nemotron-3-trader-15b-lora.gguf -b 14336 -ub 256
+./build/bin/llama-finetune-qlora --model ~/nemotron-3-trader-15b-Q4_K_M.gguf --train-file ~/repos/llm-trading-arena/unsloth-api/llama.cpp/tools/moe-pruning/training-data.jsonl -t 24 --lora-rank 128 --lora-alpha 256 -c 14336 --save-every 10 --lora-out ~/nemotron-3-trader-15b-lora.gguf -b 14336 -ub 512 -ngl 13
 
-./llama-finetune-qlora --train-file ~/repos/llm-trading-arena/unsloth-api/llama.cpp/tools/moe-pruning/training-data.jsonl -t 24 --lora-rank 16 --lora-alpha 32 -c 4096 --save-every 10  -b 14336 -ub 512 --model ~/lmstudio-community-qwen3-1.7b.gguf --lora-out ~/qwen3-trader-1.7b.gguf
+./llama-finetune-qlora --train-file ~/repos/llm-trading-arena/unsloth-api/llama.cpp/tools/moe-pruning/training-data.jsonl -t 24 --lora-rank 64 --lora-alpha 128 -c 14336 --save-every 10  -b 14336 -ub 512 --model ~/lmstudio-community-qwen3-1.7b.gguf --lora-out ~/qwen3-trader-1.7b.gguf
 
 ./llama-finetune-qlora --train-file ~/repos/llm-trading-arena/unsloth-api/llama.cpp/tools/moe-pruning/rwsft-training-data.jsonl -t 24 --lora-rank 128 --lora-alpha 256 -c 14336 --save-every 1  -b 14336 -ub 512 --freeze-layers 8 --grad-checkpoint 48 --model ~/Falcon-H1R-7B-UD-Q8_K_XL.gguf --lora-out ~/falcon-h1r-trader-7b.gguf
 
@@ -144,8 +144,10 @@ Let's output that.
 }
 
 2### ./build/bin/llama-cli --model ~/nemotron-3-trader-15b-Q4_K_M.gguf --lora ~/nemotron-3-trader-15b-lora.gguf.ckpt10.gguf -dev none -ngl 0 -no-cnv -f tools/moe-pruning/prompt_example.txt
+	TOTALLY BROKEN OUTPUT
 3### ./build/bin/llama-cli --model ~/nemotron-3-trader-15b-Q4_K_M.gguf --lora ~/nemotron-3-trader-15b-lora.gguf.ckpt20.gguf -dev none -ngl 0 -no-cnv -f tools/moe-pruning/prompt_example.txt
-
+	TOTALLY BROKEN OUTPUT
+	
 ** baseline 15b     - [1]1.2532,[2]1.2402,[3]1.2203,[4]1.1793,	./tools/moe-pruning/eval-ppl.sh ~/nemotron-3-trader-15b-Q4_K_M.gguf
 lora 15b 			- [1]1.2796,[2]1.2647,[3]1.2418,[4]1.2008, 	./tools/moe-pruning/eval-ppl.sh ~/nemotron-3-trader-15b-Q4_K_M.gguf ~/nemotron-3-trader-15b-lora.gguf.ckpt2.gguf
 lora 15b 			- [1]33497.9112,[2]33196.7132,[3]33526.8630,[4]33274.1838, 	./tools/moe-pruning/eval-ppl.sh ~/nemotron-3-trader-15b-Q4_K_M.gguf ~/nemotron-3-trader-15b-lora.gguf.ckpt100.gguf
@@ -154,3 +156,11 @@ lora 15b 			- [1]33497.9112,[2]33196.7132,[3]33526.8630,[4]33274.1838, 	./tools/
    2. **MUL_MAT_ID backward** — enable gradient flow through MoE expert dispatch layers; previously attempted but crashed because `ids` tensor lives on CPU when the backward graph tries to run it as a CUDA op
    3. **Static training graphs** — eliminate ~480ms/ubatch overhead from rebuilding backward graph every ubatch via `ggml_opt_build`
    4. **Phase 3: GRPO** — sample G responses, score, compute group-relative advantages, scale gradients
+   
+
+git stash
+git checkout 491844d4
+cmake --build build --target llama-finetune-qlora -j$(nproc)
+# train and test
+git checkout master
+git stash pop
