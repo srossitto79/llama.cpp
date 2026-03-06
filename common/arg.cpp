@@ -3557,22 +3557,27 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         { "-lr", "--learning-rate" }, "ALPHA",
         string_format("adamw or sgd optimizer alpha (default: %.2g); note: sgd alpha recommended ~10x (no momentum)", (double) params.lr.lr0),
         [](common_params & params, const std::string & value) { params.lr.lr0 = std::stof(value); }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg({ "-lr-min", "--learning-rate-min" }, "ALPHA",
         string_format("(if >0) final learning rate after decay (if -decay-epochs is set, default=%.2g)",
             (double) params.lr.lr_min),
         [](common_params & params, const std::string & value) { params.lr.lr_min = std::stof(value); }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
         {"-decay-epochs", "--learning-rate-decay-epochs"}, "ALPHA",
         string_format("(if >0) decay learning rate to -lr-min after this many epochs (exponential decay, default=%.2g)", (double) params.lr.decay_epochs),
         [](common_params & params, const std::string & value) { params.lr.decay_epochs = std::stof(value); }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
         {"-wd", "--weight-decay"}, "WD",
         string_format("adamw or sgd optimizer weight decay (0 is off; recommend very small e.g. 1e-9) (default: %.2g).", (double) params.lr.wd),
         [](common_params & params, const std::string & value) { params.lr.wd = std::stof(value); }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    add_opt(common_arg(
+        {"-gc", "--grad-clip"}, "GC",
+        string_format("element-wise gradient clipping threshold for AdamW (0 = disabled, recommend 1.0) (default: %.2g).", (double) params.lr.gclip),
+        [](common_params & params, const std::string & value) { params.lr.gclip = std::stof(value); }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
         {"-val-split", "--val-split"}, "FRACTION",
         string_format("fraction of data to use as validation set for training (default: %.2g).", (double) params.val_split),

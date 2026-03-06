@@ -241,8 +241,8 @@ static std::vector<training_sample> load_jsonl(
 }
 
 // Pack variable-length samples into fixed-context-length windows and create
-// an ggml_opt_dataset. Labels for prompt tokens are set to -1 (ignored by
-// the loss in the epoch loop).
+// an ggml_opt_dataset.  All positions use the correct next-token label;
+// prompt and response tokens are treated identically in the loss.
 // window_rewards is filled with one reward weight per window (averaged over
 // the sample tokens that fall in that window). If all samples have reward=1.0
 // the vector is all-ones and has no effect.
@@ -259,7 +259,11 @@ static ggml_opt_dataset_t build_dataset(
     for (const auto & s : samples) {
         for (size_t i = 0; i + 1 < s.tokens.size(); ++i) {
             flat_tokens .push_back(s.tokens[i]);
-            flat_labels .push_back(s.is_label[i + 1] ? (int32_t)s.tokens[i + 1] : -1);
+            // Always store the correct next-token label.  Prompt positions
+            // (is_label[i+1]==false) used to store -1, which was later replaced
+            // with the *current* input token — that's the WRONG target and trains
+            // the model to repeat the last token, corrupting it over time.
+            flat_labels .push_back((int32_t)s.tokens[i + 1]);
             flat_rewards.push_back(s.reward);
         }
     }
@@ -286,8 +290,7 @@ static ggml_opt_dataset_t build_dataset(
         float reward_sum = 0.0f;
         for (int32_t j = 0; j < n_ctx; ++j) {
             data  [i * n_ctx + j] = flat_tokens[off + j];
-            int32_t lbl = flat_labels[off + j];
-            labels[i * n_ctx + j] = (lbl < 0) ? flat_tokens[off + j] : lbl;
+            labels[i * n_ctx + j] = flat_labels[off + j];
             reward_sum += flat_rewards[off + j];
         }
         window_rewards[i] = reward_sum / n_ctx;
@@ -524,6 +527,18 @@ static void save_every_callback(
         int64_t            ibatch_max,
         int64_t            t_start_us) {
     ggml_opt_epoch_callback_progress_bar(train, opt_ctx, dataset, result, ibatch, ibatch_max, t_start_us);
+
+    // Log loss at every window boundary so we can see if/when it diverges.
+    if (train && g_save_ctx) {
+        const int64_t window = ibatch / g_save_ctx->ubatch_per_ctx;
+        const int64_t ubatch_in_window = ibatch % g_save_ctx->ubatch_per_ctx;
+        if (ubatch_in_window == g_save_ctx->ubatch_per_ctx - 1) {
+            double loss = 0.0, loss_unc = 0.0;
+            ggml_opt_result_loss(result, &loss, &loss_unc);
+            fprintf(stderr, "\n[window %4ld] loss=%.4f ± %.4f\n", (long)window, loss, loss_unc);
+        }
+    }
+
     if (!train || !g_save_ctx || g_save_ctx->save_every <= 0) return;
     const int64_t window = ibatch / g_save_ctx->ubatch_per_ctx;
     if (window > 0 && window != g_save_ctx->last_saved && window % g_save_ctx->save_every == 0) {

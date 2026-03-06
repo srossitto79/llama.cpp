@@ -1,0 +1,156 @@
+sross@TURISTATION:~/repos/llm-trading-arena/unsloth-api/llama.cpp/build/bin$ ./llama-finetune-qlora --help
+
+./llama-finetune-qlora --model ~/nemotron-3-trader-15b-Q4_K_M.gguf --train-file ~/repos/llm-trading-arena/unsloth-api/llama.cpp/tools/moe-pruning/training-data.jsonl -t 24 --lora-rank 64 --lora-alpha 128 -c 14336 --save-every 10 --lora-out ~/nemotron-3-trader-15b-lora.gguf -ngl 13 -ub 512 --grad-clip 1.0
+
+./llama-finetune-qlora --model ~/nemotron-3-trader-15b-Q4_K_M.gguf --train-file ~/repos/llm-trading-arena/unsloth-api/llama.cpp/tools/moe-pruning/rwsft-training-data.jsonl -t 24 --lora-rank 128 --lora-alpha 256 -c 14336 --save-every 1 --lora-out ~/nemotron-3-trader-15b-lora.gguf -b 14336 -ub 256
+
+./llama-finetune-qlora --train-file ~/repos/llm-trading-arena/unsloth-api/llama.cpp/tools/moe-pruning/training-data.jsonl -t 24 --lora-rank 16 --lora-alpha 32 -c 4096 --save-every 10  -b 14336 -ub 512 --model ~/lmstudio-community-qwen3-1.7b.gguf --lora-out ~/qwen3-trader-1.7b.gguf
+
+./llama-finetune-qlora --train-file ~/repos/llm-trading-arena/unsloth-api/llama.cpp/tools/moe-pruning/rwsft-training-data.jsonl -t 24 --lora-rank 128 --lora-alpha 256 -c 14336 --save-every 1  -b 14336 -ub 512 --freeze-layers 8 --grad-checkpoint 48 --model ~/Falcon-H1R-7B-UD-Q8_K_XL.gguf --lora-out ~/falcon-h1r-trader-7b.gguf
+
+./llama-cli --model ~/nemotron-3-trader-15b-Q4_K_M.gguf --lora  ~/nemotron-3-trader-15b-lora.gguf.ckpt2.gguf -ngl 0
+
+./build/bin/llama-perplexity --model ~/nemotron-3-trader-15b-Q4_K_M.gguf --lora ~/nemotron-3-trader-15b-lora.gguf.ckpt3.gguf -f tools/moe-pruning/ppl-eval-val.txt -c 512 --ppl-stride 256 -ngl 0 -t 12
+
+./tools/moe-pruning/eval-ppl.sh ~/nemotron-3-trader-15b-Q4_K_M.gguf ~/nemotron-3-trader-15b-lora.gguf.ckpt3.gguf
+
+# Base (no adapter)
+./tools/moe-pruning/eval-ppl.sh ~/nemotron-3-trader-15b-Q4_K_M.gguf "" 20
+
+# With adapter
+./tools/moe-pruning/eval-ppl.sh ~/nemotron-3-trader-15b-Q4_K_M.gguf ~/nemotron-3-trader-15b-lora.gguf.ckpt3.gguf 20
+
+
+./llama-finetune-qlora --model ~/nemotron-3-trader-15b-Q4_K_M.gguf --lora ~/nemotron-3-trader-15b-lora.gguf --train-file ~/repos/llm-trading-arena/unsloth-api/llama.cpp/tools/moe-pruning/training-data.jsonl -t 24 --lora-rank 128 --lora-alpha 256 -c 14336 --save-every 50 --lora-out ~/nemotron-3-trader-15b-lora.gguf -b 14336 -ub 256 --freeze-layers 8 --grad-checkpoint 48
+# TEST REPLY ON REAL TRADING QUESTION
+## OPEN POSITIONS ##
+BTC | SHORT | Entry: $87,913.20 | Current: $87,925.90 | Qty: 0.0200 | Held: 10m | Unrealized P&L: $-0.25 (-0.01%) | Leverage: 5x | Notional: $1758.52 | Stop Loss: $88,785.3125 | Take Profit: $85,269.0625
+## PENDING ORDERS ##
+No pending orders.
+
+1### ./build/bin/llama-cli --model ~/lmstudio-community-qwen3-1.7b.gguf -dev none -ngl 0 -no-cnv -f tools/moe-pruning/prompt_example.txt
+[Start thinking]
+Okay, let's tackle this problem. The user is an elite trader looking for a valid JSON array output based on the given data. The main task is to determine the correct operation (Buy, Sell, Modify, Cancel, Close) for the current situation.
+
+First, I need to look at the current state. The user has an open position for BTC SHORT with a current price of $87,925.90, entry price $87,913.20, and a stop loss at $88,785.3125 and take profit at $85,269.0625. The unrealized P&L is -0.25%, which is a small loss. The leverage is 5x, and the notional value is $1758.52.
+
+The recent decisions include some sells and buys, but the current open position is BTC SHORT. The user's recent decision [5] was to sell BTC @5x, but the position is still open. The current time is 2026-01-29T10:23:02.025Z UTC.
+
+The user's instruction says to be patient in chop, aggressive when the edge is real. The current price is approaching a liquidation cluster, which is a risk area. The stop loss is set at $88,785.31, which is a distance of $87,925.90 - $88,785.31 = $-859.41. The take profit is $85,269.06, which is a distance of $87,925.90 - $85,269.06 = $2,656.84.
+
+The user's risk management guidelines mention that when the position has a loss, trail stops are not allowed, and the stop loss should be adjusted. However, the current unrealized loss is -0.25%, which is a small loss. The user also has a minimum hold time of 30m unless there's clear invalidation. The current hold time is 10m, which is less than 30m. Therefore, the position might need to be closed to avoid further losses.
+
+But the user's recent decision [5] was to sell BTC @5x, but the position is still open. The current price is approaching the liquidation cluster, which is a risk. The stop loss is set at $88,785.31, which is a distance from the current price. However, the take profit is set at $85,269.06, which is a larger distance. 
+
+The user's risk status shows that the current exposure is 172.9% of the account, which is a high risk. The position is open, and the unrealized loss is small but the risk is high. The user's strategy is to close positions when the edge is real, but in this case, the position is near a liquidation cluster, which is a risk. 
+
+Given the current situation, the best action is to close the position to prevent further losses. The operation would be "Close" with the current position details. The stop loss and take profit are already set, but closing the position immediately would end the trade. 
+
+Therefore, the JSON array should include the symbol, operation as "Close", and the details of the position. The chat should explain that the position is being closed due to approaching a liquidation cluster and the risk of further losses.
+[End thinking]
+
+[
+  {
+    "symbol": "BTC/USDT",
+    "operation": "Close",
+    "chat": "Close position due to approaching liquidation cluster and risk of further losses"
+  }
+]
+
+
+2### ./build/bin/llama-cli --model ~/lmstudio-community-qwen3-1.7b.gguf --lora ~/qwen3-1.7b-lora.gguf.ckpt3.gguf -dev none -ngl 0 -no-cnv -f tools/moe-pruning/prompt_example.txt
+[Start thinking]
+Okay, let's tackle this query step by step. The user wants me to output a valid JSON array based on the provided data and the trading guidelines. They mentioned that the output needs to be precise, disciplined, and risk-adjusted. 
+
+First, I need to check the requirements for the JSON structure. The required fields are symbol, operation, and chat. Additional fields depend on the operation type. The user provided several assets like BTC/USDT, ETH/USDT, etc., but I need to see which ones are relevant here.
+
+Looking at the current state, the user has multiple open positions, especially in BTC with various trades. The latest decision was to sell BTC at 5x with a position still open. The chat should explain the reasoning behind the decision. 
+
+The user also mentioned that they need to adapt sizing, leverage, and aggressiveness based on account equity and recent trades. The recent trades show some volatility and potential for risk adjustment. The user emphasized using a strict risk management approach, especially with leverage and position sizing.
+
+I need to ensure that the JSON output includes the correct operation type. Since the user wants to close positions immediately, the operation should be "Close". The chat should explain why the closing is necessary, considering the current market conditions and risk levels.
+
+Also, the user mentioned that the output must follow the field rules strictly. For the "Close" operation, the chat should be concise and explain the rationale without any extra text. The chat must be under 120 characters.
+
+Wait, the user provided a sample output structure with specific fields. Let me make sure all required fields are included. The symbol should be BTC/USUSD or something similar. The operation is "Close". The chat needs to explain the closing reason.
+
+Another thing to note is the risk parameters and position sizing. The user has a current position in BTC with a position size that might need adjustment based on the risk tolerance and current market conditions. The chat should mention the need to close positions due to market volatility and potential for loss.
+
+I should also check if there are any pending orders or liquidation zones that need to be addressed. The user mentioned liquidity zones and potential for closing orders based on the current price.
+
+Finally, the JSON must be valid and adhere to the provided schema. No extra fields or markdown. Just a JSON array with the required fields and any additional fields as needed.
+[End thinking]
+
+[
+  {
+    "symbol": "BTC/USUSD",
+    "operation": "Close",
+    "chat": "Close short position due to market volatility and risk management thresholds reached"
+  }
+]
+
+3### ./build/bin/llama-cli --model ~/lmstudio-community-qwen3-1.7b.gguf --lora ~/qwen3-1.7b-lora.gguf.ckpt6.gguf -no-cnv -f tools/moe-pruning/prompt_example.txt
+# (truncated 250 empty lines)
+
+0612
+
+# end of response
+
+1### ./build/bin/llama-cli --model ~/nemotron-3-trader-15b-Q4_K_M.gguf -dev none -ngl 0 -no-cnv -f tools/moe-pruning/prompt_example.txt
+We need to output a valid JSON array strictly following field rules. Must not include extra text. Must be a JSON object with fields: symbol, operation, chat. For Buy/Sell also amount, leverage, stopLoss, takeProfit. For Modify also stopLoss/takeProfit must be ≥0.5% from current price.
+
+We need to decide what operation to output. There's an open position: BTC | SHORT, entry $87,913.20, current $87,925.90, unrealized P&L -0.25 (-0.01%). So we might want to modify stops? Or maybe close? Or maybe add? The guidelines: "Close = a shortcut for closing existing position immediately". Also "Modify = update stops on existing position". So perhaps we should issue a Modify operation to adjust stopLoss/takeProfit because current price is $87,925.90, and we need to ensure stopLoss/takeProfit >=0.5% from current price. Must be ≥0.5% from entry? Actually for Modify, stopLoss/takeProfit must be ≥0.5% from current price (not entry price). Use % string format.
+
+We need to compute appropriate stopLoss and takeProfit percentages. The current price is $87,925.90. We need to set stopLoss and takeProfit such that they are at least 0.5% away from current price. The stopLoss is a loss level; takeProfit is profit target. Usually stopLoss is a percentage from entry? For Modify, it must be ≥0.5% from current price. That likely means the distance from current price to stopLoss and takeProfit must be at least 0.5% of price? Or maybe the stopLoss/takeProfit percentages themselves must be at least 0.5%? The wording: "stopLoss/takeProfit: MUST be ≥0.5% from CURRENT price (not entry price)". Likely they refer to the percentage value (like "2%" or "2") must be >=0.5% i.e., at least 0.5% (as a number). But also they must be expressed as string with "%" or number. So we need to set stopLoss maybe "2%" (which is 2%) which is >=0.5% so okay. takeProfit maybe "3%" (which is 3%) also >=0.5%. So we can set those.
+
+But we also need to include amount (number) for Buy/Sell operations. For Modify, we do not need amount? Actually only required fields for Buy/Sell; for Modify we need stopLoss/takeProfit fields. So we will output operation "Modify". symbol "BTC/USDT". chat string <=120 chars explaining why. stopLoss and takeProfit fields must be present? The field rules: For Modify operations: stopLoss/takeProfit: MUST be ≥0.5% from current price. Use "%" string format. So we need to include stopLoss and takeProfit fields with appropriate values.
+
+Also we might need leverage? Not required for Modify. amount? Not required. So output JSON:
+
+{
+  "symbol": "BTC/USDT",
+  "operation": "Modify",
+  "chat": "Adjust stops near liquidation cluster to protect 0.5% risk",
+  "stopLoss": "2%",
+  "takeProfit": "3%"
+}
+
+Make sure it's valid JSON, no extra fields beyond those? Additional fields for Modify: stopLoss/takeProfit must be present. Also maybe we need to include stopLoss and takeProfit as required fields? Yes.
+
+We need to ensure the chat length <=120 characters. Let's craft: "Tweak stops near liquidation zone to lock 0.5% risk, keep position alive". That's 71 characters? Let's count: "Tweak stops near liquidation zone to lock 0.5% risk, keep position alive". That's 59 maybe. It's under 120.
+
+We also need "amount" not required for Modify, so we can omit.
+
+Thus final JSON:
+
+{
+  "symbol": "BTC/USDT",
+  "operation": "Modify",
+  "chat": "Tweak stops near liquidation zone to lock 0.5% risk, keep position alive",
+  "stopLoss": "2%",
+  "takeProfit": "3%"
+}
+
+Make sure it's valid JSON, no commtrailing comm. Provide exactly that JSON, no extra text.
+
+Let's output that.
+</think>
+{
+  "symbol": "BTC/USDT",
+  "operation": "Modify",
+  "chat": "Tweak stops near liquidation zone to lock 0.5% risk, keep position alive",
+  "stopLoss": "2%",
+  "takeProfit": "3%"
+}
+
+2### ./build/bin/llama-cli --model ~/nemotron-3-trader-15b-Q4_K_M.gguf --lora ~/nemotron-3-trader-15b-lora.gguf.ckpt10.gguf -dev none -ngl 0 -no-cnv -f tools/moe-pruning/prompt_example.txt
+3### ./build/bin/llama-cli --model ~/nemotron-3-trader-15b-Q4_K_M.gguf --lora ~/nemotron-3-trader-15b-lora.gguf.ckpt20.gguf -dev none -ngl 0 -no-cnv -f tools/moe-pruning/prompt_example.txt
+
+** baseline 15b     - [1]1.2532,[2]1.2402,[3]1.2203,[4]1.1793,	./tools/moe-pruning/eval-ppl.sh ~/nemotron-3-trader-15b-Q4_K_M.gguf
+lora 15b 			- [1]1.2796,[2]1.2647,[3]1.2418,[4]1.2008, 	./tools/moe-pruning/eval-ppl.sh ~/nemotron-3-trader-15b-Q4_K_M.gguf ~/nemotron-3-trader-15b-lora.gguf.ckpt2.gguf
+lora 15b 			- [1]33497.9112,[2]33196.7132,[3]33526.8630,[4]33274.1838, 	./tools/moe-pruning/eval-ppl.sh ~/nemotron-3-trader-15b-Q4_K_M.gguf ~/nemotron-3-trader-15b-lora.gguf.ckpt100.gguf
+
+   1. **Gradient explosion** — model degrades into repetition loops after ~10 training windows; suspected root cause is the quantized OUT_PROD GPU path producing incorrect gradient magnitudes vs the CPU reference
+   2. **MUL_MAT_ID backward** — enable gradient flow through MoE expert dispatch layers; previously attempted but crashed because `ids` tensor lives on CPU when the backward graph tries to run it as a CUDA op
+   3. **Static training graphs** — eliminate ~480ms/ubatch overhead from rebuilding backward graph every ubatch via `ggml_opt_build`
+   4. **Phase 3: GRPO** — sample G responses, score, compute group-relative advantages, scale gradients

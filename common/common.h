@@ -345,6 +345,7 @@ struct lr_opt {
     float    decay_epochs = -1;   // if >0, the learning rate starts at lr0 and decays to lr_min after this many epochs
     float    scale_epoch  = 0;
     float    wd           = 0;
+    float    gclip        = 0.0f; // element-wise gradient clip (0 = disabled)
     unsigned epochs       = 2;
 
     unsigned epoch; // set by optimizer outer (epochs) loop

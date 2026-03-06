@@ -58,6 +58,8 @@ struct ggml_opt_context {
     std::vector<struct ggml_tensor *> grad_accs;
     std::vector<struct ggml_tensor *> grad_m;
     std::vector<struct ggml_tensor *> grad_v;
+    std::vector<ggml_backend_buffer_t> bufs_momenta;  // per-param moment buffers (one per param node)
+    std::vector<struct ggml_context *> ctxs_momenta;  // corresponding ggml contexts (keep alive for tensor metadata)
 
     int64_t iter               = 1;
     int32_t opt_period         = 1;
@@ -231,6 +233,7 @@ struct ggml_opt_optimizer_params ggml_opt_get_default_optimizer_params(void * us
     result.adamw.beta2 = 0.999f;
     result.adamw.eps   = 1e-8f;
     result.adamw.wd    = 0.0f;
+    result.adamw.gclip = 0.0f;
 
     result.sgd.alpha   = 1e-3f;
     result.sgd.wd      = 0.0f;
@@ -254,9 +257,10 @@ struct ggml_opt_params ggml_opt_default_params(
         /*loss_type       =*/ loss_type,
         /*build_type      =*/ GGML_OPT_BUILD_TYPE_OPT,
         /*opt_period      =*/ 1,
-        /*get_opt_pars    =*/ ggml_opt_get_default_optimizer_params,
-        /*get_opt_pars_ud =*/ nullptr,
-        /*optimizer       =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
+        /*get_opt_pars              =*/ ggml_opt_get_default_optimizer_params,
+        /*get_opt_pars_ud          =*/ nullptr,
+        /*grad_checkpoint_interval =*/ 0,
+        /*optimizer                =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
     };
 }
 
@@ -476,8 +480,23 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
             for (int i = 0; i < n_nodes; ++i) {
                 ggml_tensor * node = opt_ctx->gf->nodes[i];
                 if (node->flags & GGML_TENSOR_FLAG_PARAM) {
-                    opt_ctx->grad_m[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
-                    opt_ctx->grad_v[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                    // Allocate moments on the same buffer type as the param tensor so
+                    // the ADAMW op runs on the correct backend (avoids cross-device mismatch
+                    // when some LoRA tensors are on CPU and others on GPU with partial offload).
+                    ggml_backend_buffer_type_t param_buft = node->buffer
+                        ? ggml_backend_buffer_get_type(node->buffer)
+                        : ggml_backend_cpu_buffer_type();
+
+                    // Allocate a tiny context + buffer for this pair of moment tensors.
+                    const size_t sz = 2 * ggml_tensor_overhead();
+                    struct ggml_init_params mip = { sz, nullptr, true };
+                    struct ggml_context * mctx = ggml_init(mip);
+                    opt_ctx->grad_m[i] = ggml_new_tensor(mctx, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                    opt_ctx->grad_v[i] = ggml_new_tensor(mctx, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                    ggml_backend_buffer_t mbuf = ggml_backend_alloc_ctx_tensors_from_buft(mctx, param_buft);
+                    ggml_backend_buffer_clear(mbuf, 0);
+                    opt_ctx->bufs_momenta.push_back(mbuf);
+                    opt_ctx->ctxs_momenta.push_back(mctx); // keep alive for tensor metadata
                 } else {
                     opt_ctx->grad_m[i] = nullptr;
                     opt_ctx->grad_v[i] = nullptr;
@@ -529,7 +548,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     // gb_opt == graph backward optimize, forward pass, then backward pass to calculate gradients, then optimizer step.
     opt_ctx->gb_opt = ggml_graph_dup(opt_ctx->ctx_compute, opt_ctx->gb_grad, /*force_grads =*/ true);
 
-    opt_ctx->opt_step_params = ggml_new_tensor_1d(opt_ctx->ctx_cpu, GGML_TYPE_F32, need_momenta ? 7 : 2);
+    opt_ctx->opt_step_params = ggml_new_tensor_1d(opt_ctx->ctx_cpu, GGML_TYPE_F32, need_momenta ? 8 : 2);
     ggml_tensor * adamw_params = opt_ctx->opt_step_params;
     ggml_set_input(adamw_params);
     const char * optimizer_name = ggml_opt_optimizer_name(opt_ctx->optimizer);
@@ -614,6 +633,12 @@ void ggml_opt_free(ggml_opt_context_t opt_ctx) {
     }
     ggml_backend_buffer_free(opt_ctx->buf_static);
     ggml_backend_buffer_free(opt_ctx->buf_cpu);
+    for (ggml_backend_buffer_t buf : opt_ctx->bufs_momenta) {
+        ggml_backend_buffer_free(buf);
+    }
+    for (struct ggml_context * ctx : opt_ctx->ctxs_momenta) {
+        ggml_free(ctx);
+    }
     ggml_free(opt_ctx->ctx_static);
     ggml_free(opt_ctx->ctx_cpu);
     delete opt_ctx;
@@ -833,6 +858,7 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
                 adamw_par_data[4] = opt_pars.adamw.wd;
                 adamw_par_data[5] = beta1h;
                 adamw_par_data[6] = beta2h;
+                adamw_par_data[7] = opt_pars.adamw.gclip;
             } break;
             case GGML_OPT_OPTIMIZER_TYPE_SGD: {
                 GGML_ASSERT(opt_pars.sgd.alpha > 0.0f);

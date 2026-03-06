@@ -2,6 +2,7 @@
 #include "convert.cuh"
 
 #include <cstdint>
+#include <vector>
 
 void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
@@ -118,5 +119,113 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                             &beta,  dst_d  + i3*s3  + i2*s2,                ldc));
             }
         }
+    }
+}
+
+// ggml_cuda_out_prod_id — scattered outer-product for MUL_MAT_ID backward (grad w.r.t. src0).
+//
+//   a   = src0: [cols, n_expert_used, n_tokens]  F32
+//   b   = src1: [rows, n_expert_used, n_tokens]  F32
+//   ids = src2: [n_expert_used, n_tokens]        i32  (may be CPU-resident in backward graph)
+//   dst:        [cols, rows, n_expert, 1]         F32
+//
+//   dst[:, :, e] += a[:, i, t] ⊗ b[:, i, t]   ∀ (i,t) : ids[i,t] == e
+//
+// Algorithm:
+//   1. Read ids from CPU (memcpy) or GPU (cudaMemcpy).
+//   2. Bucket tokens per expert.
+//   3. For each expert with >0 tokens: gather a_tokens and b_tokens into contiguous buffers,
+//      then cublasSgemm with beta=1 to accumulate into dst[:,:,e].
+
+void ggml_cuda_out_prod_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0]; // a [cols, n_exp_used, n_tokens]
+    const ggml_tensor * src1 = dst->src[1]; // b [rows, n_exp_used, n_tokens]
+    const ggml_tensor * ids  = dst->src[2]; // [n_exp_used, n_tokens] i32
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    const int64_t cols       = src0->ne[0];
+    const int64_t n_exp_used = src0->ne[1];
+    const int64_t n_tokens   = src0->ne[2];
+    const int64_t rows       = src1->ne[0];
+    const int64_t n_expert   = dst->ne[2];
+
+    cudaStream_t   stream = ctx.stream();
+    cublasHandle_t handle = ctx.cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+
+    // Zero dst
+    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
+
+    // Read ids to host
+    const size_t ids_nbytes = ggml_nbytes(ids);
+    std::vector<char> ids_host(ids_nbytes);
+    if (ids->buffer && !ggml_backend_buffer_is_host(ids->buffer)) {
+        CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ids_nbytes, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    } else {
+        memcpy(ids_host.data(), ids->data, ids_nbytes);
+    }
+
+    // Build per-expert token lists: for each (iexp, itok) pair, find which expert it maps to
+    std::vector<std::vector<int64_t>> expert_tokens(n_expert); // expert_tokens[e] = list of flat (iexp*n_tokens+itok)
+    for (int64_t itok = 0; itok < n_tokens; ++itok) {
+        for (int64_t iexp = 0; iexp < n_exp_used; ++iexp) {
+            const int32_t expert_id = *(const int32_t *)(ids_host.data()
+                + itok * ids->nb[1] + iexp * ids->nb[0]);
+            GGML_ASSERT(expert_id >= 0 && expert_id < n_expert);
+            expert_tokens[expert_id].push_back(iexp * n_tokens + itok);
+        }
+    }
+
+    // For each expert, gather tokens and do cublasSgemm
+    const float alpha_one = 1.0f;
+    const float beta_acc  = 1.0f; // accumulate (dst already zeroed above)
+
+    const float * a_base = (const float *) src0->data; // [cols, n_exp_used, n_tokens]
+    const float * b_base = (const float *) src1->data; // [rows, n_exp_used, n_tokens]
+    float       * d_base = (float       *) dst->data;  // [cols, rows, n_expert]
+
+    // Stride layout: src0 nb[0]=sizeof(float), nb[1]=cols*sizeof(float), nb[2]=cols*n_exp_used*sizeof(float)
+    const int64_t a_stride_exp  = src0->nb[1] / sizeof(float); // cols
+    const int64_t a_stride_tok  = src0->nb[2] / sizeof(float); // cols * n_exp_used
+    const int64_t b_stride_exp  = src1->nb[1] / sizeof(float); // rows
+    const int64_t b_stride_tok  = src1->nb[2] / sizeof(float); // rows * n_exp_used
+    const int64_t dst_stride_e  = dst->nb[2]  / sizeof(float); // cols * rows
+
+    for (int64_t e = 0; e < n_expert; ++e) {
+        const auto & toks = expert_tokens[e];
+        if (toks.empty()) continue;
+
+        const int64_t ntoks_e = (int64_t) toks.size();
+
+        // Allocate gathered a_e [cols, ntoks_e] and b_e [rows, ntoks_e] on GPU
+        ggml_cuda_pool_alloc<float> a_gathered(ctx.pool(), cols * ntoks_e);
+        ggml_cuda_pool_alloc<float> b_gathered(ctx.pool(), rows * ntoks_e);
+
+        // Gather token columns from GPU src0/src1 using device-to-device cudaMemcpyAsync.
+        // src0->data and src1->data are GPU pointers — must NOT memcpy on the host.
+        for (int64_t ti = 0; ti < ntoks_e; ++ti) {
+            const int64_t flat = toks[ti];
+            const int64_t iexp = flat / n_tokens;
+            const int64_t itok = flat % n_tokens;
+            const float * a_col = a_base + iexp * a_stride_exp + itok * a_stride_tok;
+            const float * b_col = b_base + iexp * b_stride_exp + itok * b_stride_tok;
+            CUDA_CHECK(cudaMemcpyAsync(a_gathered.ptr + ti * cols, a_col,
+                        cols * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(b_gathered.ptr + ti * rows, b_col,
+                        rows * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+        }
+
+        // cublasSgemm: C[cols,rows] += A[cols,ntoks_e] @ B[rows,ntoks_e]^T
+        //   (column-major: A is [cols, ntoks_e] with lda=cols, B is [rows, ntoks_e] with ldb=rows)
+        float * dst_e = d_base + e * dst_stride_e;
+        CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T,
+                cols, rows, ntoks_e,
+                &alpha_one, a_gathered.ptr, cols,
+                            b_gathered.ptr, rows,
+                &beta_acc,  dst_e,          cols));
     }
 }

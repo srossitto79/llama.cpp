@@ -1713,6 +1713,7 @@ ggml_opt_optimizer_params common_opt_lr_pars(void * userdata) {
     const lr_opt &            d      = *(lr_opt *) userdata;
     result.adamw.alpha = result.sgd.alpha = d.get_lr(d.epoch);
     result.sgd.wd = result.adamw.wd = d.wd;
+    result.adamw.gclip = d.gclip;
     return result;
 }
 

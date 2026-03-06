@@ -2334,8 +2334,14 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     ggml_cuda_pool_alloc<char>  dst_sorted(ctx.pool(), ne2 *n_expert_used* ne0*ts_dst_sorted);
 
     std::vector<char> ids_host(ggml_nbytes(ids));
-    CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (ids->buffer && !ggml_backend_buffer_is_host(ids->buffer)) {
+        // ids is on GPU (normal forward pass)
+        CUDA_CHECK(cudaMemcpyAsync(ids_host.data(), ids->data, ggml_nbytes(ids), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    } else {
+        // ids is CPU-resident (e.g. backward graph where ids is a forward-graph leaf)
+        memcpy(ids_host.data(), ids->data, ggml_nbytes(ids));
+    }
 
     for (int64_t i02 = 0; i02 < ne02; ++i02) { // expert matrices
         for (int64_t i12 = 0; i12 < ne12; ++i12) { // tokens
@@ -2624,6 +2630,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
+            break;
+        case GGML_OP_OUT_PROD_ID:
+            ggml_cuda_out_prod_id(ctx, dst);
             break;
         case GGML_OP_SCALE:
             ggml_cuda_op_scale(ctx, dst);
@@ -4640,6 +4649,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 && op->src[1]->type == GGML_TYPE_F32
                 && op->src[0]->nb[0] == ggml_type_size(op->src[0]->type)  // src0 not transposed (required)
                 && !ggml_is_transposed(op->src[0]);
+        case GGML_OP_OUT_PROD_ID:
+            // Scattered outer-product for MUL_MAT_ID backward (grad w.r.t. F32 expert weights).
+            // Only F32 src0/src1 supported (LoRA A/B matrices are always F32).
+            return op->type == GGML_TYPE_F32
+                && op->src[0]->type == GGML_TYPE_F32
+                && op->src[1]->type == GGML_TYPE_F32
+                && op->src[2] != nullptr && op->src[2]->type == GGML_TYPE_I32;
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {

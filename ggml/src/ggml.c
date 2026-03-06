@@ -976,6 +976,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MUL_MAT",
     "MUL_MAT_ID",
     "OUT_PROD",
+    "OUT_PROD_ID",
 
     "SCALE",
     "SET",
@@ -1048,7 +1049,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
+static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1085,6 +1086,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "X*Y",
     "X[i]*Y",
     "X*Y",
+    "X_id⊗Y_id",
 
     "x*v",
     "y-\\>view(x)",
@@ -1157,7 +1159,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 95, "GGML_OP_COUNT != 95");
+static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3287,6 +3289,44 @@ struct ggml_tensor * ggml_out_prod(
     result->op     = GGML_OP_OUT_PROD;
     result->src[0] = a;
     result->src[1] = b;
+
+    return result;
+}
+
+// ggml_out_prod_id
+//
+// Scattered outer-product for the MUL_MAT_ID backward pass.
+//
+//   a:   [cols, n_expert_used, n_tokens]  — activations (or grad-activations)
+//   b:   [rows, n_expert_used, n_tokens]  — grad-output  (or activations)
+//   ids: [n_expert_used, n_tokens] (i32)  — expert dispatch indices
+//   result: [cols, rows, n_expert, 1]
+//
+//   result[:, :, e] += sum_{(i,t): ids[i,t]==e} a[:, i, t] ⊗ b[:, i, t]
+//
+// This is the gradient of a's expert-weight src0 in MUL_MAT_ID.
+
+struct ggml_tensor * ggml_out_prod_id(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids,
+        int64_t               n_expert) {
+    GGML_ASSERT(a->type   == GGML_TYPE_F32);
+    GGML_ASSERT(b->type   == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(a->ne[1]  == b->ne[1]);           // n_expert_used matches
+    GGML_ASSERT(a->ne[2]  == b->ne[2]);           // n_tokens matches
+    GGML_ASSERT(ids->ne[0] == a->ne[1]);          // n_expert_used matches ids
+    GGML_ASSERT(ids->ne[1] == a->ne[2]);          // n_tokens matches ids
+
+    const int64_t ne[4] = { a->ne[0], b->ne[0], n_expert, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_OUT_PROD_ID;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = ids;
 
     return result;
 }
@@ -6053,7 +6093,7 @@ struct ggml_tensor * ggml_opt_step_adamw(
     GGML_ASSERT(ggml_are_same_shape(a, m));
     GGML_ASSERT(ggml_are_same_shape(a, v));
     GGML_ASSERT(adamw_params->type == GGML_TYPE_F32);
-    GGML_ASSERT(ggml_nelements(adamw_params) == 7);
+    GGML_ASSERT(ggml_nelements(adamw_params) == 8);
 
     struct ggml_tensor * result = ggml_view_tensor(ctx, a);
 
@@ -6463,6 +6503,20 @@ static void ggml_compute_backward(
                             src0,               // [n,m,q1,r1]
                             ggml_transpose(ctx, // [p,m,qq,rr]
                                 grad)));        // [m,p,qq,rr]
+            }
+        } break;
+        case GGML_OP_MUL_MAT_ID: {
+            // Only reached when src0 is F32 (LoRA A/B weights). Quantized expert weights
+            // are fully stop-gradient (ignore_src[0]=ignore_src[1]=true in grads_needed).
+            const int64_t n_expert = src0->ne[2];
+            if (src1_needs_grads) {
+                struct ggml_tensor * as_T = ggml_cont(ctx, ggml_permute(ctx, src0, 1, 0, 2, 3));
+                struct ggml_tensor * grad_b = ggml_mul_mat_id(ctx, as_T, grad, src2);
+                ggml_add_or_set(ctx, cgraph, isrc1, grad_b);
+            }
+            if (src0_needs_grads) {
+                struct ggml_tensor * grad_as = ggml_out_prod_id(ctx, src1, grad, src2, n_expert);
+                ggml_add_or_set(ctx, cgraph, isrc0, grad_as);
             }
         } break;
         case GGML_OP_SCALE: {
@@ -6933,9 +6987,20 @@ void ggml_build_backward_expand(
                 ignore_src[2] = true;
                 break;
 
+            // MUL_MAT_ID backward: grad flows through src1 (activations) when src0 is F32 LoRA.
+            // src0 is ignored when quantized (frozen expert weights).
+            // src2 (ids) is always integer — no gradient.
+            case GGML_OP_MUL_MAT_ID:
+                if (ggml_is_quantized(node->src[0]->type)) {
+                    ignore_src[0] = true;
+                    ignore_src[1] = true;  // no grad through activations if weights frozen
+                }
+                ignore_src[2] = true; // ids: integer
+                ignore_src[3] = true;
+                break;
+
             // Ops with no backward implementation — stop gradient propagation through all
             // their sources so the backward graph builder never tries to compute a gradient.
-            case GGML_OP_MUL_MAT_ID:    // sparse MoE expert dispatch — backward not yet safe
             case GGML_OP_SSM_SCAN:      // Mamba2 selective-scan (state update + output)
             case GGML_OP_SSM_CONV:      // Mamba2 causal conv1d over SSM state
             case GGML_OP_FLASH_ATTN_EXT: // flash attention has no backward; use standard attn for training

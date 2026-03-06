@@ -4369,6 +4369,80 @@ void ggml_compute_forward_out_prod(
     }
 }
 
+// ggml_compute_forward_out_prod_id
+//
+// CPU fallback for the MUL_MAT_ID backward scattered outer-product.
+//   src0 (a)   [cols, n_expert_used, n_tokens]
+//   src1 (b)   [rows, n_expert_used, n_tokens]
+//   src2 (ids) [n_expert_used, n_tokens] (i32)
+//   dst        [cols, rows, n_expert, 1]
+//
+//   dst[:, :, e] += a[:, i, t] ⊗ b[:, i, t]  ∀ (i,t) : ids[i,t] == e
+
+static void ggml_compute_forward_out_prod_id_f32(
+        const ggml_compute_params * params,
+              ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0]; // a [cols, n_exp_used, n_tokens]
+    const ggml_tensor * src1 = dst->src[1]; // b [rows, n_exp_used, n_tokens]
+    const ggml_tensor * ids  = dst->src[2]; // ids [n_exp_used, n_tokens] i32
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(src1->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids->type  == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+
+    const int ith = params->ith;
+
+    // CPU fallback: run single-threaded on thread 0 to avoid write-write races
+    // (multiple tokens can map to the same expert, requiring serial accumulation).
+    // In practice this path is only hit when CUDA is not available; the CUDA path
+    // handles parallelism correctly with gather + cuBLAS.
+    if (ith != 0) {
+        return;
+    }
+
+    const int64_t cols       = src0->ne[0];
+    const int64_t n_exp_used = src0->ne[1];
+    const int64_t n_tokens   = src0->ne[2];
+    const int64_t rows       = src1->ne[0];
+    const int64_t n_expert   = dst->ne[2];
+
+    // Zero dst
+    ggml_vec_set_f32(cols * rows * n_expert, (float *)dst->data, 0.0f);
+
+    // Accumulate outer products, routing each (iexp_used, itok) pair to its expert
+    for (int64_t itok = 0; itok < n_tokens; ++itok) {
+        for (int64_t iexp_used = 0; iexp_used < n_exp_used; ++iexp_used) {
+            const int32_t expert_id = *(const int32_t *)((const char *)ids->data
+                + itok * ids->nb[1] + iexp_used * ids->nb[0]);
+            GGML_ASSERT(expert_id >= 0 && expert_id < n_expert);
+
+            const float * a_vec = (const float *)((const char *)src0->data
+                + iexp_used * src0->nb[1] + itok * src0->nb[2]);  // [cols]
+            const float * b_vec = (const float *)((const char *)src1->data
+                + iexp_used * src1->nb[1] + itok * src1->nb[2]);  // [rows]
+
+            float * dst_e = (float *)((char *)dst->data + expert_id * dst->nb[2]); // [cols, rows]
+
+            // dst_e[c, r] += a_vec[c] * b_vec[r]  (outer product, accumulate)
+            for (int64_t r = 0; r < rows; ++r) {
+                const float bv = b_vec[r];
+                for (int64_t c = 0; c < cols; ++c) {
+                    dst_e[c + r * cols] += a_vec[c] * bv;
+                }
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_out_prod_id(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    GGML_ASSERT(dst->src[0]->type == GGML_TYPE_F32);
+    ggml_compute_forward_out_prod_id_f32(params, dst);
+}
+
 // ggml_compute_forward_scale
 
 static void ggml_compute_forward_scale_f32(
@@ -10845,7 +10919,7 @@ static void ggml_compute_forward_opt_step_adamw_f32(
     GGML_ASSERT(ggml_are_same_shape(src0, src0_grad));
     GGML_ASSERT(ggml_are_same_shape(src0, src0_grad_m));
     GGML_ASSERT(ggml_are_same_shape(src0, src0_grad_v));
-    GGML_ASSERT(ggml_nelements(adamw_params) == 7);
+    GGML_ASSERT(ggml_nelements(adamw_params) == 8);
 
     const int ith = params->ith;
     const int nth = params->nth;
@@ -10871,6 +10945,7 @@ static void ggml_compute_forward_opt_step_adamw_f32(
     const float wd     = adamw_params_ptr[4];
     const float beta1h = adamw_params_ptr[5];
     const float beta2h = adamw_params_ptr[6];
+    const float gclip  = adamw_params_ptr[7]; // gradient clipping threshold (0 = disabled)
     const float keep   = 1.f - alpha * wd;
     for (int ir = ir0; ir < ir1; ++ir) {
         const int64_t i03 = ir/(ne02*ne01);
@@ -10885,8 +10960,12 @@ static void ggml_compute_forward_opt_step_adamw_f32(
         float       * v = (float       *) ((char       *) src0_grad_v->data + offset);
 
         for (int i00 = 0; i00 < ne00; ++i00) {
-            m[i00] = m[i00]*beta1 +        g[i00]*(1.0f - beta1);
-            v[i00] = v[i00]*beta2 + g[i00]*g[i00]*(1.0f - beta2);
+            float gi = g[i00];
+            if (gclip > 0.0f) {
+                gi = fmaxf(-gclip, fminf(gclip, gi));
+            }
+            m[i00] = m[i00]*beta1 +      gi*(1.0f - beta1);
+            v[i00] = v[i00]*beta2 + gi*gi*(1.0f - beta2);
 
             const float mh =       m[i00]*beta1h;
             const float vh = sqrtf(v[i00]*beta2h) + eps;

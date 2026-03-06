@@ -501,6 +501,7 @@ extern "C" {
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
         GGML_OP_OUT_PROD,
+        GGML_OP_OUT_PROD_ID,
 
         GGML_OP_SCALE,
         GGML_OP_SET,
@@ -1422,6 +1423,20 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    // Scattered outer-product for MoE backward:
+    //   a:   [cols, n_expert_used, n_tokens]  (activations / grad activations)
+    //   b:   [rows, n_expert_used, n_tokens]  (grad output / activations)
+    //   ids: [n_expert_used, n_tokens] (i32)
+    //   result: [cols, rows, n_expert]  — grad w.r.t. expert weight matrices
+    //
+    // result[:, :, e] += a[:, i, t] ⊗ b[:, i, t]  for all (i,t) where ids[i,t] == e
+    GGML_API struct ggml_tensor * ggml_out_prod_id(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids,
+            int64_t               n_expert);
 
     //
     // operations on tensors without backpropagation
