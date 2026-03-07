@@ -2682,6 +2682,7 @@ void llama_context::opt_epoch_iter(
 
         uint32_t pos_batch = 0;
         static bool timings_printed = false;  // print per-ubatch timings only for the first window
+        struct ggml_context * ctx_compute_opt = nullptr;
         do {
             const auto & ubatch = mctx->get_ubatch();
 
@@ -2701,13 +2702,11 @@ void llama_context::opt_epoch_iter(
 
             auto * gf = model.build_graph(gparams);
 
-            struct ggml_context * ctx_compute_opt;
-            {
+            // Allocate the tensor metadata context once, then reset it each iteration.
+            // ggml_reset() is much cheaper than ggml_free()+ggml_init() — it just resets the
+            // allocation pointer without freeing/reallocating the backing memory buffer.
+            if (!ctx_compute_opt) {
                 const size_t size_gf = ggml_graph_size(gf);
-                // graph_max_nodes() pre-inflates size_gf by 4x during training so that
-                // gb_grad = ggml_graph_dup(gf) and gb_opt = ggml_graph_dup(gb_grad) both
-                // have enough capacity for the backward+optimizer nodes.
-                // The context needs space for tensor metadata of 3 graphs of size_gf each.
                 const size_t size_meta = 4*size_gf*ggml_tensor_overhead() + 3*ggml_graph_overhead_custom(size_gf, /*grads = */ true);
                 struct ggml_init_params params = {
                     /*.mem_size   =*/ size_meta,
@@ -2719,6 +2718,8 @@ void llama_context::opt_epoch_iter(
                     LLAMA_LOG_INFO("%s: [timing] graph capacity=%zu n_nodes=%d size_meta=%.1fMB\n", __func__,
                             size_gf, ggml_graph_n_nodes(gf), (double)size_meta / (1024*1024));
                 }
+            } else {
+                ggml_reset(ctx_compute_opt);
             }
 
             const int64_t t1_alloc = ggml_time_ms();
@@ -2756,10 +2757,10 @@ void llama_context::opt_epoch_iter(
             if (callback) {
                 callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
             }
-            ggml_free(ctx_compute_opt);
 
             pos_batch += ubatch.n_tokens;
         } while (mctx->next());
+        ggml_free(ctx_compute_opt);
     }
 }
 

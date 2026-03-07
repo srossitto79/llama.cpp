@@ -756,6 +756,22 @@ int main(int argc, char ** argv) {
                         ggml_opt_epoch_callback_progress_bar,
                         params.shuffle_dataset);
         fprintf(stderr, "\n");
+
+        // Per-epoch loss summary
+        {
+            double train_loss = 0.0, train_unc = 0.0;
+            ggml_opt_result_loss(result_train, &train_loss, &train_unc);
+            if (idata_split < ggml_opt_dataset_ndata(dataset)) {
+                double val_loss = 0.0, val_unc = 0.0;
+                ggml_opt_result_loss(result_eval, &val_loss, &val_unc);
+                LOG_INF("epoch %d/%d: train_loss=%.4f ± %.4f  val_loss=%.4f ± %.4f\n",
+                        params.lr.epoch + 1, params.lr.epochs, train_loss, train_unc, val_loss, val_unc);
+            } else {
+                LOG_INF("epoch %d/%d: train_loss=%.4f ± %.4f\n",
+                        params.lr.epoch + 1, params.lr.epochs, train_loss, train_unc);
+            }
+        }
+
         ggml_opt_result_reset(result_train);
         ggml_opt_result_reset(result_eval);
     }

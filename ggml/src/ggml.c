@@ -6761,7 +6761,11 @@ static void ggml_compute_backward(
                     }
                 } break;
                 default: {
-                    fprintf(stderr, "%s: unsupported unary op for backward pass: %s\n",
+                    fprintf(stderr, "%s: unsupported unary op for backward pass: %s\n"
+                        "  If this is GELU/GELU_ERF/GELU_QUICK, the model architecture uses a "
+                        "non-gated GELU activation which has no backward implementation yet.\n"
+                        "  Models with gated GELU (GEGLU) are also not yet supported for backward.\n"
+                        "  Supported activations: SILU (most LLaMA/Qwen/Nemotron models), RELU.\n",
                         __func__, ggml_unary_op_name(ggml_get_unary_op(tensor)));
                     GGML_ABORT("fatal error");
                 } //break;
@@ -6785,7 +6789,12 @@ static void ggml_compute_backward(
                     }
                 } break;
                 default: {
-                    GGML_ABORT("unsupported glu op for backward pass: %s", ggml_glu_op_name(ggml_get_glu_op(tensor)));
+                    fprintf(stderr, "%s: unsupported GLU op for backward pass: %s\n"
+                        "  Only SWIGLU (split) backward is implemented. GEGLU/REGLU backward "
+                        "requires a dedicated GELU/RELU backward kernel (not yet available).\n"
+                        "  Most modern LLMs (LLaMA, Qwen, Nemotron, Mistral) use SWIGLU and work fine.\n",
+                        __func__, ggml_glu_op_name(ggml_get_glu_op(tensor)));
+                    GGML_ABORT("fatal error");
                 } //break;
             }
         } break;

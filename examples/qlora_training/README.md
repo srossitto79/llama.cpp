@@ -68,6 +68,9 @@ Trains LoRA adapters on a quantized GGUF model.
 | `--save-every` | `0` | Save checkpoint every N dataset windows (0 = end only) |
 | `--freeze-layers` | `0` | Skip LoRA on first N transformer layers (blk.0..N-1); backward already pruned automatically |
 | `--grad-checkpoint` | `0` | Mark every Nth forward node persistent to reduce activation VRAM; good values: 32–64 |
+| `--train-on-prompt` | off | Compute loss on prompt tokens too (default: response-only loss) |
+| `--shuffle-dataset` | off | Shuffle dataset windows at the start of each epoch |
+| `--val-split` | `0.0` | Fraction of data to hold out for validation (e.g. `0.1` = 10%); val loss logged per epoch |
 | `-epochs` / `--epochs` | `3` | Training epochs |
 | `-c` / `--ctx-size` | `512` | Training context window (tokens) |
 | `-b` / `--batch-size` | `2048` | Tokens per `llama_decode` call; set equal to `-c` |
@@ -108,7 +111,7 @@ MoE expert tensors (`*_exps`) are always excluded — they use `MUL_MAT_ID` whic
 
 ### Dataset format (JSONL)
 
-**Chat format** (loss on assistant turns only):
+**Chat format** (loss on response only; use `--train-on-prompt` for all tokens):
 ```json
 {"messages": [{"role": "user", "content": "Hello"}, {"role": "assistant", "content": "Hi!"}]}
 ```
@@ -178,9 +181,16 @@ Gradients propagate through all layers that have LoRA adapters. Use `--freeze-la
 |---|---|---|---|
 | ✅ Done | **`--freeze-layers N`** — no LoRA on first N layers; backward auto-pruned | Proportional to N/total | Implemented |
 | ✅ Done | **`--grad-checkpoint N`** — keep every Nth activation alive through backward | Reduces peak activation VRAM | Implemented |
-| Medium | **Static training graphs** — build backward graph once, reuse every ubatch | Eliminate ~0.5 s/step overhead | Planned |
-| Medium | **`MUL_MAT_ID` backward** — enable LoRA on MoE expert layers | Unlocks Mixtral/Qwen-MoE | Planned |
+| ✅ Done | **`--train-on-prompt`** — compute loss on prompt tokens too | Configurable loss target | Implemented |
+| ✅ Done | **`--shuffle-dataset`** — shuffle windows each epoch | Better convergence | Implemented |
+| ✅ Done | **BOS separators** — insert BOS between concatenated samples | Correct cross-sample boundaries | Implemented |
+| ✅ Done | **Per-epoch loss summary** — log train/val loss after each epoch | Observability | Implemented |
+| ✅ Done | **`MUL_MAT_ID` backward** — LoRA on MoE dense FFN layers; `OUT_PROD_ID` for scattered outer product | Unlocks Mixtral/Nemotron-MoE | Implemented |
+| ✅ Done | **Quantized `OUT_PROD`** — dequantize on GPU + cuBLAS for backward matmul | Full GPU training (no CPU fallback) | Implemented |
+| Medium | **Reuse `ctx_compute_opt`** — allocate tensor metadata context once, reuse across ubatches | Eliminate ~0.5 s/step overhead | Planned |
+| Medium | **Static training graphs** — build backward graph once, reuse every ubatch | Largest single perf win | Planned |
 | Low | **`SSM_SCAN/CONV` backward** — enable LoRA on Mamba SSM layers | Unlocks NemotronH SSM layers | Planned |
+| Low | **GELU backward** — implement `ggml_gelu_back` kernel (UNARY + GLU) | Support GPT-2/Phi-style models | Planned (needs new CUDA/CPU kernels) |
 
 ---
 
@@ -193,9 +203,11 @@ Gradients propagate through all layers that have LoRA adapters. Use `--freeze-la
 | `ggml/src/ggml.c` | Backward graph fixes: `GET_ROWS` 3D, `SET_ROWS`, `MUL_MAT_ID`, `SSM_SCAN/CONV`, `FLASH_ATTN_EXT` all stop gradient; inplace-op assert → warn+skip |
 | `src/llama-context.cpp` | `opt_init`: scheduler and graph sized with inflated capacity before `ggml_opt_init`; `opt_epoch_iter`: per-ubatch timing instrumentation; reward scaling via `g_reward_weights` TLS |
 | `src/llama-adapter.cpp` | Repack-buft fallback for LoRA tensors: tries device-native buft before CPU |
-| `common/common.h` | Added `save_every`, `lora_freeze_layers`, `grad_checkpoint_interval` fields |
-| `common/arg.cpp` | Added `--save-every`, `--freeze-layers`, `--grad-checkpoint` arguments |
-| `include/llama.h` | Added `llama_opt_set_reward_weights()`; `grad_checkpoint_interval` in `llama_opt_params` |
+| `common/common.h` | Added `save_every`, `lora_freeze_layers`, `grad_checkpoint_interval`, `train_on_prompt`, `shuffle_dataset` fields |
+| `common/arg.cpp` | Added `--save-every`, `--freeze-layers`, `--grad-checkpoint`, `--train-on-prompt`, `--shuffle-dataset` arguments |
+| `include/llama.h` | Added `llama_opt_set_reward_weights()`; `grad_checkpoint_interval` in `llama_opt_params`; `shuffle` param in `llama_opt_epoch` |
+| `ggml/src/ggml-cuda/out-prod.cu` | `OUT_PROD` with quantized src0 (dequantize on GPU + cuBLAS); `OUT_PROD_ID` for MoE backward |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | `supports_op` for quantized `OUT_PROD` and `OUT_PROD_ID`; CPU-resident ids fix in `mul_mat_id` |
 | `ggml/include/ggml-opt.h` | Added `grad_checkpoint_interval` to `ggml_opt_params` |
 | `ggml/src/ggml-opt.cpp` | Gradient checkpointing: marks every Nth forward node `GGML_TENSOR_FLAG_OUTPUT` before backward build |
 

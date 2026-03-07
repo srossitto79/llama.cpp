@@ -3582,7 +3582,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-val-split", "--val-split"}, "FRACTION",
         string_format("fraction of data to use as validation set for training (default: %.2g).", (double) params.val_split),
         [](common_params & params, const std::string & value) { params.val_split = std::stof(value); }
-    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE, LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
         {"-epochs", "--epochs"}, "N",
         string_format("optimizer max # of epochs (default: %d)", params.lr.epochs),

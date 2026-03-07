@@ -1,6 +1,6 @@
 sross@TURISTATION:~/repos/llm-trading-arena/unsloth-api/llama.cpp/build/bin$ ./llama-finetune-qlora --help
 
-./llama-finetune-qlora --model ~/nemotron-3-trader-15b-Q4_K_M.gguf --train-file ~/repos/llm-trading-arena/unsloth-api/llama.cpp/tools/moe-pruning/training-data.jsonl -t 24 --lora-rank 64 --lora-alpha 128 -c 14336 --save-every 10 --lora-out ~/nemotron-3-trader-15b-lora.gguf -ngl 13 -ub 512 --grad-clip 1.0
+./llama-finetune-qlora --model ~/nemotron-3-trader-15b-Q4_K_M.gguf --train-file ~/repos/llm-trading-arena/unsloth-api/llama.cpp/tools/moe-pruning/training-data.jsonl -t 24 --lora-rank 128 --lora-alpha 256 -c 14336 --save-every 10 --lora-out ~/nemotron-3-trader-15b-lora.gguf -ngl 13 -ub 512
 
 ./build/bin/llama-finetune-qlora --model ~/nemotron-3-trader-15b-Q4_K_M.gguf --train-file ~/repos/llm-trading-arena/unsloth-api/llama.cpp/tools/moe-pruning/training-data.jsonl -t 24 --lora-rank 128 --lora-alpha 256 -c 14336 --save-every 10 --lora-out ~/nemotron-3-trader-15b-lora.gguf -b 14336 -ub 512 -ngl 13
 
@@ -22,6 +22,7 @@ sross@TURISTATION:~/repos/llm-trading-arena/unsloth-api/llama.cpp/build/bin$ ./l
 
 
 ./llama-finetune-qlora --model ~/nemotron-3-trader-15b-Q4_K_M.gguf --lora ~/nemotron-3-trader-15b-lora.gguf --train-file ~/repos/llm-trading-arena/unsloth-api/llama.cpp/tools/moe-pruning/training-data.jsonl -t 24 --lora-rank 128 --lora-alpha 256 -c 14336 --save-every 50 --lora-out ~/nemotron-3-trader-15b-lora.gguf -b 14336 -ub 256 --freeze-layers 8 --grad-checkpoint 48
+
 # TEST REPLY ON REAL TRADING QUESTION
 ## OPEN POSITIONS ##
 BTC | SHORT | Entry: $87,913.20 | Current: $87,925.90 | Qty: 0.0200 | Held: 10m | Unrealized P&L: $-0.25 (-0.01%) | Leverage: 5x | Notional: $1758.52 | Stop Loss: $88,785.3125 | Take Profit: $85,269.0625
@@ -164,3 +165,18 @@ cmake --build build --target llama-finetune-qlora -j$(nproc)
 # train and test
 git checkout master
 git stash pop
+
+Priority Order for Implementation
+#	Task	Impact	Effort
+1	--train-on-prompt	Correctness	Small
+2	--shuffle-dataset	Correctness	Small
+3	Sample boundary BOS	Correctness	Small
+4	Reuse ctx_compute_opt	~0.5s/step faster	Medium
+5	Validation loss logging	Overfitting detection	Medium
+6	Per-epoch loss summary	Observability	Small
+7	GELU backward	Support more architectures	Medium
+8	README updates	Documentation	Small
+9	Static training graphs	Largest perf win	Large
+I'd suggest tackling 1-3 together (all small, all in finetune_qlora.cpp), then 4 (the buffer reuse — immediate speed win), then 5-6 (observability), then 7-8, and leaving 9 for last since it's the most complex.
+
+Want me to start implementing? I'd begin with items 1-3 as a single batch.
