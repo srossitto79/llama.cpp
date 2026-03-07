@@ -778,6 +778,19 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
         ggml_graph_reset(opt_ctx->gb_grad);
     }
+
+    // For non-static graphs the gb_grad pointer is nulled after each ggml_opt_eval(),
+    // so the ggml_graph_reset() above is a no-op.  We must zero the persistent gradient
+    // accumulators directly at the start of every new accumulation cycle, otherwise
+    // gradients from previous cycles keep piling up and the optimizer diverges.
+    // For opt_period == 1 every step is a full cycle so we always zero.
+    if (!opt_ctx->static_graphs && backward && opt_ctx->opt_i == 0 && !opt_ctx->grad_accs.empty()) {
+        for (size_t i = 0; i < opt_ctx->grad_accs.size(); ++i) {
+            if (opt_ctx->grad_accs[i]) {
+                ggml_set_zero(opt_ctx->grad_accs[i]);
+            }
+        }
+    }
     if (backward) {
         const int32_t opt_i_next = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
         opt_ctx->build_type = opt_i_next == 0 ? GGML_OPT_BUILD_TYPE_OPT : GGML_OPT_BUILD_TYPE_GRAD;
