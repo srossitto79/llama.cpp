@@ -1564,7 +1564,8 @@ extern "C" {
             ggml_opt_result_t         result_eval,
             int64_t                   idata_split,
             ggml_opt_epoch_callback   callback_train,
-            ggml_opt_epoch_callback   callback_eval);
+            ggml_opt_epoch_callback   callback_eval,
+            bool                      shuffle);
 
 #ifdef __cplusplus
 }

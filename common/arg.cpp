@@ -3644,6 +3644,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) { params.grad_checkpoint_interval = value; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
     add_opt(common_arg(
+        {"--train-on-prompt"},
+        "compute loss on prompt tokens too, not just the response (default: response-only loss)",
+        [](common_params & params) { params.train_on_prompt = true; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    add_opt(common_arg(
+        {"--shuffle-dataset"},
+        "shuffle dataset windows at the start of each epoch (default: sequential order)",
+        [](common_params & params) { params.shuffle_dataset = true; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE_QLORA }));
+    add_opt(common_arg(
         {"--save-logits"},
         string_format("save final logits to files for verification (default: %s)", params.save_logits ? "true" : "false"),
         [](common_params & params) {

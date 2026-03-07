@@ -2780,7 +2780,8 @@ void llama_context::opt_epoch(
         ggml_opt_result_t         result_eval,
         int64_t                   idata_split,
         ggml_opt_epoch_callback   callback_train,
-        ggml_opt_epoch_callback   callback_eval) {
+        ggml_opt_epoch_callback   callback_eval,
+        bool                      shuffle) {
     const uint32_t n_ctx    = this->n_ctx();
     const uint32_t n_batch  = std::min(cparams.n_batch,  n_ctx);
     const uint32_t n_ubatch = std::min(cparams.n_ubatch, n_batch);
@@ -2788,6 +2789,10 @@ void llama_context::opt_epoch(
 
     GGML_ASSERT(idata_split >= 0);
     GGML_ASSERT(idata_split <= ndata);
+
+    if (shuffle && idata_split > 1) {
+        ggml_opt_dataset_shuffle(opt_ctx, dataset, idata_split);
+    }
 
     const uint32_t ubatch_per_ctx = n_ctx / n_ubatch;
 
@@ -3562,12 +3567,14 @@ void llama_opt_epoch(
         ggml_opt_result_t         result_eval,
         int64_t                   idata_split,
         ggml_opt_epoch_callback   callback_train,
-        ggml_opt_epoch_callback   callback_eval) {
+        ggml_opt_epoch_callback   callback_eval,
+        bool                      shuffle) {
     ctx->opt_epoch(
         dataset,
         result_train,
         result_eval,
         idata_split,
         callback_train,
-        callback_eval);
+        callback_eval,
+        shuffle);
 }

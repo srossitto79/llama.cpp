@@ -249,30 +249,34 @@ static std::vector<training_sample> load_jsonl(
 static ggml_opt_dataset_t build_dataset(
         const std::vector<training_sample> & samples,
         int32_t                              n_ctx,
-        std::vector<float>                 & window_rewards) {
+        std::vector<float>                 & window_rewards,
+        bool                                 train_on_prompt = false,
+        llama_token                          bos_token = -1) {
 
     // Flatten samples into token/label/reward streams
     std::vector<llama_token> flat_tokens;
     std::vector<int32_t>     flat_labels;  // -1 = no loss, token_id = loss target
     std::vector<float>       flat_rewards; // per-token reward from the source sample
 
-    // LABEL_FIX toggle:
-    //   false (default) = prompt positions get label = current input token (original behavior,
-    //                     known to work — gradient is small because the model already "knows"
-    //                     the current token from context).
-    //   true            = prompt positions get the correct next-token label (theoretically
-    //                     correct, but adds loss on ALL positions which can overwhelm small
-    //                     datasets — test carefully before enabling).
-    constexpr bool LABEL_FIX = true;
+    for (size_t si = 0; si < samples.size(); ++si) {
+        const auto & s = samples[si];
 
-    for (const auto & s : samples) {
+        // Insert BOS separator between samples to prevent cross-sample predictions.
+        // The first sample already has BOS from tokenization (add_special=true).
+        if (si > 0 && bos_token >= 0 && !s.tokens.empty()) {
+            flat_tokens .push_back(bos_token);
+            flat_labels .push_back(-1);  // no loss on separator
+            flat_rewards.push_back(s.reward);
+        }
+
         for (size_t i = 0; i + 1 < s.tokens.size(); ++i) {
             flat_tokens .push_back(s.tokens[i]);
-            if (LABEL_FIX) {
-                // All positions get correct next-token label
+            if (train_on_prompt) {
+                // All positions get correct next-token label (prompt + response)
                 flat_labels.push_back((int32_t)s.tokens[i + 1]);
             } else {
-                // Prompt positions get -1 (replaced with current token below)
+                // Only response positions get loss; prompt positions get -1 (replaced with
+                // current token below — gradient is ~zero because model already knows it)
                 flat_labels.push_back(s.is_label[i + 1] ? (int32_t)s.tokens[i + 1] : -1);
             }
             flat_rewards.push_back(s.reward);
@@ -694,7 +698,8 @@ int main(int argc, char ** argv) {
 
     const int32_t n_ctx = llama_n_ctx(ctx);
     std::vector<float> window_rewards;
-    auto dataset = build_dataset(samples, n_ctx, window_rewards);
+    const llama_token bos = llama_vocab_bos(llama_model_get_vocab(model));
+    auto dataset = build_dataset(samples, n_ctx, window_rewards, params.train_on_prompt, bos);
     if (!dataset) return 1;
 
     // Check if any reward deviates from 1.0 — if so, enable reward-weighted SFT
@@ -729,8 +734,9 @@ int main(int argc, char ** argv) {
     g_save_ctx = &sctx;
 
     const int64_t total_windows = ggml_opt_dataset_ndata(dataset);
-    LOG_INF("%s: starting QLoRA training — rank=%d alpha=%.1f epochs=%d\n",
-            __func__, params.lora_rank, lora_alpha, params.lr.epochs);
+    LOG_INF("%s: starting QLoRA training — rank=%d alpha=%.1f epochs=%d loss=%s\n",
+            __func__, params.lora_rank, lora_alpha, params.lr.epochs,
+            params.train_on_prompt ? "prompt+response" : "response-only");
     LOG_INF("%s: dataset: %ld windows × %d ubatches = %ld steps per epoch  (n_ctx=%d n_ubatch=%d stride=%d)\n",
             __func__, (long)total_windows, ubatch_per_ctx, (long)(idata_split * ubatch_per_ctx),
             n_ctx, n_ubatch, n_ctx / 2);
@@ -747,7 +753,8 @@ int main(int argc, char ** argv) {
         sctx.last_saved = 0;  // reset per-epoch window counter
         llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split,
                         cb_train,
-                        ggml_opt_epoch_callback_progress_bar);
+                        ggml_opt_epoch_callback_progress_bar,
+                        params.shuffle_dataset);
         fprintf(stderr, "\n");
         ggml_opt_result_reset(result_train);
         ggml_opt_result_reset(result_eval);
