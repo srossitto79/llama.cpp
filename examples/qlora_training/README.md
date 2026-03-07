@@ -95,19 +95,19 @@ Use `-c` equal to your target sequence length. More context = more windows per s
 
 llama.cpp uses **internal GGUF tensor names**, not HuggingFace names:
 
-| llama.cpp internal | HuggingFace equivalent | Trainable? |
+| llama.cpp internal | HuggingFace equivalent | Status |
 |---|---|---|
-| `attn_q` | `q_proj` | ✅ default |
-| `attn_output` | `o_proj` | ✅ default |
-| `ffn_gate` | `gate_proj` | ✅ default |
-| `ffn_up` | `up_proj` | ✅ default |
-| `ffn_down` | `down_proj` | ✅ default |
-| `attn_k` | `k_proj` | ❌ zero gradient (KV scatter) |
-| `attn_v` | `v_proj` | ❌ zero gradient (KV scatter) |
-| `ssm_in` | `in_proj` | ❌ zero gradient (SSM_SCAN no backward) |
-| `ssm_out` | `out_proj` | ❌ zero gradient (SSM_SCAN no backward) |
+| `attn_q` | `q_proj` | ✅ default target, trainable |
+| `attn_output` | `o_proj` | ✅ default target, trainable |
+| `ffn_gate` | `gate_proj` | ✅ default target, trainable |
+| `ffn_up` | `up_proj` | ✅ default target, trainable |
+| `ffn_down` | `down_proj` | ✅ default target, trainable |
+| `attn_k` | `k_proj` | ❌ not in defaults — zero gradient (KV scatter via SET_ROWS) |
+| `attn_v` | `v_proj` | ❌ not in defaults — zero gradient (KV scatter via SET_ROWS) |
+| `ssm_in` | `in_proj` | ❌ not in defaults — zero gradient (SSM_SCAN no backward) |
+| `ssm_out` | `out_proj` | ❌ not in defaults — zero gradient (SSM_SCAN no backward) |
 
-MoE expert tensors (`*_exps`) use `MUL_MAT_ID` — LoRA on the dense projection layers is supported (backward via `OUT_PROD_ID`), but the quantized expert weights themselves are frozen (stop-gradient).
+**MoE models:** Expert tensors (`*_exps`) are excluded regardless of `--lora-targets`. The quantized expert weights are frozen (stop-gradient), but LoRA on the dense FFN layers (`ffn_gate`, `ffn_up`, `ffn_down`) works — backward via `MUL_MAT_ID` + `OUT_PROD_ID`.
 
 ### Dataset format (JSONL)
 

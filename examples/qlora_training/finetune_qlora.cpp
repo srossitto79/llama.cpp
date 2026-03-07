@@ -6,31 +6,35 @@
 // is saved as a GGUF file that is directly compatible with the existing
 // llama_adapter_lora_init() loader and llama-export-lora merge tool.
 //
-// Usage example (Nemotron / NemotronH — attention + MLP + Mamba layers):
+// Usage example:
 /*   llama-finetune-qlora \
-         --model nemotron-h-q4_k_m.gguf \
+         --model model-q4_k_m.gguf \
          --train-file train.jsonl \
          --lora-rank 16 --lora-alpha 16 \
-         --lora-targets "attn_q,attn_output,ffn_gate,ffn_up,ffn_down,ssm_in,ssm_out" \
          --lora-out adapter.gguf \
-         --epochs 3 -c 512
-*/    
-// NOTE: attn_k and attn_v are excluded from the default targets.  The KV write path uses
-// ggml_set_rows (a scatter op with view_src set) and the backward graph cannot propagate
-// gradients through it — LoRA K/V would receive zero gradient.  You can add them explicitly
-// with --lora-targets if you want to experiment, but expect no learning signal for K/V.
+         --epochs 3 -c 4096 -b 4096 -ub 512
+*/
+// Default targets: attn_q, attn_output, ffn_gate, ffn_up, ffn_down
+// Override with --lora-targets "comma,separated,substrings"
 //
-// NOTE: MoE expert tensors (*_exps: ffn_gate_exps, ffn_up_exps, ffn_down_exps) are always
-// excluded regardless of --lora-targets.  They use ggml_mul_mat_id (sparse expert dispatch)
-// which has no backward implementation.  Dense FFN tensors (ffn_gate, ffn_up, ffn_down on
-// non-MoE layers) are still trainable.
+// NOTE: attn_k and attn_v are excluded from defaults.  The KV write path uses
+// ggml_set_rows (scatter op) — backward cannot propagate gradients through it.
+// LoRA K/V would receive zero gradient.
+//
+// NOTE: ssm_in and ssm_out (Mamba/NemotronH) are excluded from defaults.
+// SSM_SCAN/SSM_CONV have no backward implementation — LoRA on these layers
+// would receive zero gradient.  Adding them wastes memory with no benefit.
+//
+// NOTE: MoE expert tensors (*_exps) are excluded regardless of --lora-targets.
+// The quantized expert weights are frozen (stop-gradient), but LoRA on dense
+// FFN layers (ffn_gate, ffn_up, ffn_down) works via MUL_MAT_ID backward.
 //
 // Target substrings use llama.cpp internal GGUF names (NOT HuggingFace names):
 //   attn_q      = q_proj       attn_k     = k_proj
 //   attn_v      = v_proj       attn_output= o_proj
 //   ffn_gate    = gate_proj    ffn_up     = up_proj    ffn_down = down_proj
-//   ssm_in      = in_proj (Mamba/NemotronH)
-//   ssm_out     = out_proj (Mamba/NemotronH)
+//   ssm_in      = in_proj (Mamba/NemotronH)  — zero gradient, not in defaults
+//   ssm_out     = out_proj (Mamba/NemotronH)  — zero gradient, not in defaults
 
 #include "arg.h"
 #include "chat.h"
