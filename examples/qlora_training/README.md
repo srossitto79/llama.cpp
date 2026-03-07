@@ -107,7 +107,7 @@ llama.cpp uses **internal GGUF tensor names**, not HuggingFace names:
 | `ssm_in` | `in_proj` | ❌ zero gradient (SSM_SCAN no backward) |
 | `ssm_out` | `out_proj` | ❌ zero gradient (SSM_SCAN no backward) |
 
-MoE expert tensors (`*_exps`) are always excluded — they use `MUL_MAT_ID` which has no backward.
+MoE expert tensors (`*_exps`) use `MUL_MAT_ID` — LoRA on the dense projection layers is supported (backward via `OUT_PROD_ID`), but the quantized expert weights themselves are frozen (stop-gradient).
 
 ### Dataset format (JSONL)
 
@@ -187,8 +187,8 @@ Gradients propagate through all layers that have LoRA adapters. Use `--freeze-la
 | ✅ Done | **Per-epoch loss summary** — log train/val loss after each epoch | Observability | Implemented |
 | ✅ Done | **`MUL_MAT_ID` backward** — LoRA on MoE dense FFN layers; `OUT_PROD_ID` for scattered outer product | Unlocks Mixtral/Nemotron-MoE | Implemented |
 | ✅ Done | **Quantized `OUT_PROD`** — dequantize on GPU + cuBLAS for backward matmul | Full GPU training (no CPU fallback) | Implemented |
-| Medium | **Reuse `ctx_compute_opt`** — allocate tensor metadata context once, reuse across ubatches | Eliminate ~0.5 s/step overhead | Planned |
-| Medium | **Static training graphs** — build backward graph once, reuse every ubatch | Largest single perf win | Planned |
+| ✅ Done | **Reuse `ctx_compute_opt`** — allocate tensor metadata context once, `ggml_reset()` across ubatches | Eliminate ~0.5 s/step overhead | Implemented |
+| ❌ Skip | **Static training graphs** — KV mask shape changes per ubatch (`n_kv` grows); graph topology not static | Would need KV cache redesign | Not feasible |
 | Low | **`SSM_SCAN/CONV` backward** — enable LoRA on Mamba SSM layers | Unlocks NemotronH SSM layers | Planned |
 | Low | **GELU backward** — implement `ggml_gelu_back` kernel (UNARY + GLU) | Support GPT-2/Phi-style models | Planned (needs new CUDA/CPU kernels) |
 
