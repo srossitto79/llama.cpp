@@ -116,7 +116,7 @@ llama_prune_hard_prune_report llama_prune_hard_prune_gemma4_q4_0(
         const std::string & output_path) {
     if (model_path == output_path) throw std::runtime_error("hard pruning never modifies the source GGUF in place");
     common_moe_prune_profile_validate(profile, model_info);
-    if (model_info.architecture != "gemma4" || model_info.layer_count != 30) {
+    if (!common_moe_prune_is_supported_architecture(model_info.architecture, model_info.layer_count)) {
         throw std::runtime_error("unsupported architecture: hard pruning supports Gemma 4 26B A4B only");
     }
 

@@ -105,6 +105,10 @@ void write_json_atomic(const json & value, const std::string & path) {
 
 }
 
+bool common_moe_prune_is_supported_architecture(const std::string & architecture, int32_t layer_count) {
+    return architecture == COMMON_MOE_PRUNE_GEMMA4_ARCHITECTURE && layer_count == COMMON_MOE_PRUNE_GEMMA4_LAYER_COUNT;
+}
+
 double common_moe_prune_expert_stats::mean_probability() const {
     return selection_count == 0 ? 0.0 : probability_sum / selection_count;
 }
@@ -153,12 +157,13 @@ common_moe_prune_model_info common_moe_prune_inspect_model(const std::string & p
 
     common_moe_prune_model_info result;
     result.architecture = gguf_get_val_str(ctx.get(), arch_id);
-    if (result.architecture != "gemma4") {
+    if (result.architecture != COMMON_MOE_PRUNE_GEMMA4_ARCHITECTURE) {
         throw std::runtime_error("unsupported architecture: MoE pruning supports Gemma 4 26B A4B only");
     }
     result.layer_count = metadata_i32(ctx.get(), "gemma4.block_count");
-    if (result.layer_count != 30) {
-        throw std::runtime_error("unsupported Gemma 4 variant: expected 30 layers for 26B A4B");
+    if (!common_moe_prune_is_supported_architecture(result.architecture, result.layer_count)) {
+        throw std::runtime_error("unsupported Gemma 4 variant: expected " +
+            std::to_string(COMMON_MOE_PRUNE_GEMMA4_LAYER_COUNT) + " layers for 26B A4B");
     }
     result.expert_count = metadata_i32(ctx.get(), "gemma4.expert_count");
     result.experts_used = metadata_i32(ctx.get(), "gemma4.expert_used_count");

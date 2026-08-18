@@ -1438,6 +1438,24 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
 // llm_graph_context
 //
 
+// During warmup, every expert must be exercised at least once so its compute subgraph gets
+// built/allocated before the first real request (see ggml-org/llama.cpp#11571). With MoE pruning
+// active, experts disabled via hparams.moe_disabled_experts are logit-masked and will never be
+// selected at inference time, so warming only the surviving experts is sufficient. Falling back to
+// the ordinary top-k count here would leave most surviving experts lazily initialized.
+static uint32_t llm_graph_warmup_n_expert_used(const llama_hparams & hparams) {
+    if (!hparams.moe_prune_active) {
+        return hparams.n_expert;
+    }
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        const auto & disabled = hparams.moe_disabled_experts[il];
+        if (disabled.any()) {
+            return hparams.n_expert - (uint32_t) disabled.count();
+        }
+    }
+    return hparams.n_expert;
+}
+
 llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     arch             (params.arch),
     hparams          (params.hparams),
@@ -1455,7 +1473,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     n_embd_head_v    (hparams.n_embd_head_v()),
     n_embd_v_gqa     (hparams.n_embd_v_gqa()),
     n_expert         (hparams.n_expert),
-    n_expert_used    (cparams.warmup && !hparams.moe_prune_active ? hparams.n_expert : hparams.n_expert_used),
+    n_expert_used    (cparams.warmup ? llm_graph_warmup_n_expert_used(hparams) : hparams.n_expert_used),
     freq_base        (cparams.rope_freq_base),
     freq_scale       (cparams.rope_freq_scale),
     ext_factor       (cparams.yarn_ext_factor),

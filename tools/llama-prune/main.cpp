@@ -44,6 +44,8 @@ struct options {
     llama_prune_ppl_mask mask = llama_prune_ppl_mask::ASSISTANT;
     std::vector<double> ratios;
     double max_layer_ratio = 0.25;
+    bool validate = false;
+    double max_ppl_delta_percent = 5.0;
     int32_t seed = 42;
     int32_t n_ctx = 4096;
     int32_t n_batch = 512;
@@ -103,11 +105,13 @@ void usage() {
         "  llama-prune analyze --model MODEL --dataset DATA --ratios RATIO,... --output-dir DIR [options]\n"
         "  llama-prune profiles --importance-cache CACHE --ratios RATIO,... --output-dir DIR [options]\n"
         "  llama-prune inspect --model MODEL --profile PROFILE\n"
-        "  llama-prune hard --model MODEL --profile PROFILE --output MODEL [--dataset DATA]\n\n"
+        "  llama-prune hard --model MODEL --profile PROFILE --output MODEL [--dataset DATA] [--validate] [--max-ppl-delta-percent PCT]\n\n"
         "options:\n"
         "  --metric router-output\n"
         "  --ppl-mask all|assistant|reasoning|content\n"
         "  --max-layer-ratio RATIO\n"
+        "  --validate                  fail `hard` if the hard-pruned perplexity delta exceeds --max-ppl-delta-percent (requires --dataset)\n"
+        "  --max-ppl-delta-percent PCT maximum tolerated relative perplexity delta for --validate (default: 5.0)\n"
         "  --importance-cache FNAME\n"
         "  --evaluate | --no-evaluate  evaluate each generated ratio (default: evaluate)\n"
         "  --seed N\n"
@@ -166,7 +170,8 @@ options parse_options(int argc, char ** argv) {
         else if (arg == "--n-gpu-layers" || arg == "-ngl") result.n_gpu_layers = std::stoi(value(i));
         else if (arg == "--evaluate") result.evaluate_ratios = true;
         else if (arg == "--no-evaluate") result.evaluate_ratios = false;
-        else if (arg == "--validate") {}
+        else if (arg == "--validate") result.validate = true;
+        else if (arg == "--max-ppl-delta-percent") result.max_ppl_delta_percent = std::stod(value(i));
         else throw std::runtime_error("unknown option: " + arg);
     }
     if (result.command != "profiles" && result.model.empty()) throw std::runtime_error("--model is required");
@@ -178,6 +183,8 @@ options parse_options(int argc, char ** argv) {
     }
     if ((result.command == "inspect" || result.command == "hard") && result.profile.empty()) throw std::runtime_error("--profile is required");
     if (result.command == "hard" && result.output.empty()) throw std::runtime_error("hard requires --output");
+    if (result.command == "hard" && result.validate && result.dataset.empty()) throw std::runtime_error("hard --validate requires --dataset");
+    if (result.max_ppl_delta_percent < 0.0) throw std::runtime_error("--max-ppl-delta-percent must be non-negative");
     if (result.metric != "router-output") throw std::runtime_error("unsupported importance metric: " + result.metric);
     if (result.n_ctx < 2 || result.n_batch < 1 || result.n_ubatch < 1) throw std::runtime_error("invalid context or batch size");
     if (result.dataset_threads < 0) throw std::runtime_error("dataset threads must be non-negative");
@@ -870,6 +877,8 @@ void run_hard(const options & opts) {
         const double soft_ppl = soft_evaluation.ppl(opts.mask);
         const double hard_ppl = hard_evaluation->ppl(opts.mask);
         const double difference = hard_ppl - soft_ppl;
+        const double relative_percent = soft_ppl == 0.0 ? 0.0 : difference * 100.0 / soft_ppl;
+        const bool within_tolerance = std::fabs(relative_percent) <= opts.max_ppl_delta_percent;
         const std::string report_path = staging_output + ".report.json";
         std::ifstream report_in(report_path);
         json report_json_value;
@@ -880,6 +889,9 @@ void run_hard(const options & opts) {
             { "soft_perplexity", soft_ppl },
             { "hard_perplexity", hard_ppl },
             { "absolute_difference", difference },
+            { "relative_difference_percent", relative_percent },
+            { "max_ppl_delta_percent", opts.max_ppl_delta_percent },
+            { "within_tolerance", within_tolerance },
             { "evaluated_token_count", hard_evaluation->evaluated[(size_t) opts.mask] },
         };
         const std::string tmp_report = report_path + ".tmp";
@@ -890,15 +902,26 @@ void run_hard(const options & opts) {
             std::remove(tmp_report.c_str());
             throw std::runtime_error("failed to update hard-pruning validation report");
         }
-        std::cout << "soft perplexity: " << soft_ppl << "\nhard perplexity: " << hard_ppl << "\nabsolute difference: " << difference << '\n';
+        std::cout << "soft perplexity: " << soft_ppl << "\nhard perplexity: " << hard_ppl << "\nabsolute difference: " << difference
+                  << "\nrelative difference: " << relative_percent << "%\n";
+        if (opts.validate && !within_tolerance) {
+            throw std::runtime_error(
+                "hard-pruning validation failed: relative perplexity delta " + std::to_string(relative_percent) +
+                "% exceeds --max-ppl-delta-percent " + std::to_string(opts.max_ppl_delta_percent) +
+                "% (soft=" + std::to_string(soft_ppl) + ", hard=" + std::to_string(hard_ppl) +
+                "); output was not committed, staging files and report are at " + staging_output);
+        }
     }
     if (std::rename(staging_output.c_str(), opts.output.c_str()) != 0) {
         throw std::runtime_error("failed to atomically replace hard-pruned GGUF output");
     }
-    if (std::rename((staging_output + ".report.json").c_str(), (opts.output + ".report.json").c_str()) != 0) {
-        throw std::runtime_error("failed to replace hard-pruning report");
-    }
+    // The model is now safely at its final location: from here on the guard must not delete
+    // anything, since staging_output no longer refers to a rollback-able intermediate state.
     guard.committed = true;
+    if (std::rename((staging_output + ".report.json").c_str(), (opts.output + ".report.json").c_str()) != 0) {
+        throw std::runtime_error("hard-pruned model written to " + opts.output +
+            ", but failed to move its report; the report remains at " + staging_output + ".report.json");
+    }
     std::cout << "hard-pruned model validated\nsource bytes: " << report.source_bytes << "\noutput bytes: " << report.output_bytes
               << "\nexpert bytes removed: " << report.expert_bytes_removed << "\nreport: " << opts.output << ".report.json\n";
 }

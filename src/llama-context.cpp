@@ -3560,7 +3560,6 @@ void llama_context::opt_epoch_iter(
                     // contribution.  Do NOT write anything — ggml_set_zero already handled it.
                     if (labels_sparse[ilabel] < 0) continue;
                     GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
-                    ggml_backend_tensor_set(labels, &reward_scale, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                     const float active_label_scale = critical_metadata ? 1.0f : label_scale;
                     ggml_backend_tensor_set(labels, &active_label_scale, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
                     if (critical_metadata) {

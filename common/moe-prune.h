@@ -7,6 +7,18 @@
 #include <string>
 #include <vector>
 
+// Static MoE pruning (common/moe-prune.cpp and tools/llama-prune/) currently supports exactly one
+// checkpoint family: the Gemma 4 26B A4B Q4_0 QAT GGUF layout loaded by src/models/gemma4.cpp.
+// common_moe_prune_is_supported_architecture() is the single source of truth for that check on the
+// GGUF-metadata side (common/moe-prune.cpp, tools/llama-prune/hard-prune.cpp). The runtime soft-prune
+// path in src/llama-model.cpp cannot depend on common/, so it re-expresses the same constraint via
+// LLM_ARCH_GEMMA4 / LLM_TYPE_26B_A4B (llama_model_set_moe_prune) — keep that check's layer-count
+// assumption in sync with COMMON_MOE_PRUNE_GEMMA4_LAYER_COUNT when either changes.
+constexpr const char * COMMON_MOE_PRUNE_GEMMA4_ARCHITECTURE = "gemma4";
+constexpr int32_t COMMON_MOE_PRUNE_GEMMA4_LAYER_COUNT = 30;
+
+bool common_moe_prune_is_supported_architecture(const std::string & architecture, int32_t layer_count);
+
 struct common_moe_prune_layer {
     std::vector<int32_t> disabled_experts;
 };
