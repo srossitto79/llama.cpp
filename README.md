@@ -16,6 +16,27 @@
 
 </div>
 
+## About this fork
+
+This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp), kept in sync with upstream via regular merges, that adds the following on top of it:
+
+### MoE expert pruning — `llama-prune`
+
+Static (hard) and dynamic (soft) expert pruning for Gemma 4 26B A4B MoE checkpoints, using the REAP saliency criterion ([arXiv:2510.13999](https://arxiv.org/abs/2510.13999)). Soft pruning disables experts at inference time via router-logit masking without touching any weights; hard pruning compacts the GGUF to physically remove them. See [docs/moe-pruning.md](docs/moe-pruning.md).
+
+The profiling engine and REAP/EAN calibration statistics originate from an earlier `tools/expert-profile` + Python pruning prototype by [@srossitto79](https://github.com/srossitto79); the C++ port, soft-pruning graph mask, profile format, and importance cache were added by [@DFveloper](https://github.com/DFveloper).
+
+### Native QLoRA training with reward-weighted / critical-token SFT — `llama-finetune-qlora`
+
+A native QLoRA fine-tuning pipeline for quantized GGUF models: base weights stay frozen, only freshly-allocated F32 LoRA A/B tensors are trained, and the resulting adapter is directly compatible with `llama_adapter_lora_init` / `llama-export-lora`. See [examples/qlora_training/README.md](examples/qlora_training/README.md).
+
+- QLoRA training loop, reward-weight scaling, and gradient-clipping (`gclip`) support in the AdamW optimizer step across the CPU, CUDA, Metal, and Vulkan backends — [@srossitto79](https://github.com/srossitto79).
+- Critical/weighted-token SFT loss (per-span and per-sample loss weighting) and a threaded ChatML/JSONL dataset loader (`common/jsonl.*`) — [@DFveloper](https://github.com/DFveloper).
+
+### GGUF model merging — `llama-model-merge`
+
+Merges multiple GGUF checkpoints into one via TIES (task-vector merging) or Evo (CMA-ES-optimized) merging, with optional GPU-accelerated fitness evaluation and an INI config-file mode — [@DFveloper](https://github.com/DFveloper).
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
