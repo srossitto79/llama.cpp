@@ -297,6 +297,7 @@ struct lora_merge_ctx {
     file_input base_model;
     std::vector<std::unique_ptr<file_input>> adapters;
     ggml_type out_type;
+    bool output_type_explicit;
 
     // for computing merged tensor
     int n_threads;
@@ -313,7 +314,9 @@ struct lora_merge_ctx {
             std::string & base_fname,
             std::vector<common_adapter_lora_info> & lora_files,
             std::string & outfile,
-            int n_threads) : base_model(base_fname, 0), n_threads(n_threads), fout(outfile, std::ios::binary) {
+            int n_threads,
+            ggml_type output_type,
+            bool output_type_was_explicit) : base_model(base_fname, 0), out_type(output_type), output_type_explicit(output_type_was_explicit), n_threads(n_threads), fout(outfile, std::ios::binary) {
         fout.exceptions(std::ofstream::failbit); // fail fast on write errors
 
         for (auto & lora_inp : lora_files) {
@@ -354,10 +357,11 @@ struct lora_merge_ctx {
     }
 
     ggml_type get_out_tensor_type(struct ggml_tensor * t) {
-        if (t->type == GGML_TYPE_F32) {
-            return GGML_TYPE_F32;
-        } else {
-            return GGML_TYPE_F16;
+        // Preserve the historical default: F32 tensors stay F32 and all
+        // other tensors are written as F16. An explicit --type requests a
+        // uniform output type wherever the tensor shape supports it.
+        if (!output_type_explicit) {
+            return t->type == GGML_TYPE_F32 ? GGML_TYPE_F32 : GGML_TYPE_F16;
         }
         if (t->ne[0] % ggml_blck_size(out_type) != 0) {
             return t->type;
@@ -590,7 +594,6 @@ struct lora_merge_ctx {
 static void print_usage(int, char ** argv) {
     printf("\nexample usage:\n");
     printf("\n  %s -m base-model.gguf --lora lora-file.gguf -o merged-model.gguf --type q4_0\n", argv[0]);
-    printf("\n  %s -m base-model.gguf --lora lora-file.gguf -o merged-model.gguf --qat q4_0\n", argv[0]);
     printf("\n--type accepts any ggml tensor type that can be produced from F32, e.g.:\n  ");
     auto names = list_supported_type_names();
     for (size_t i = 0; i < names.size(); ++i) {
@@ -602,7 +605,7 @@ static void print_usage(int, char ** argv) {
 // Pulls "--type <value>" out of argv (if present) and returns argv/argc
 // with it stripped, so downstream common_params_parse() doesn't choke on
 // an option it doesn't know about. Returns the requested type via out_type.
-static std::vector<std::string> extract_type_arg(int argc, char ** argv, ggml_type & out_type) {
+static std::vector<std::string> extract_type_arg(int argc, char ** argv, ggml_type & out_type, bool & type_was_explicit) {
     std::vector<std::string> filtered;
     filtered.reserve(argc);
 
@@ -616,21 +619,8 @@ static std::vector<std::string> extract_type_arg(int argc, char ** argv, ggml_ty
                 throw std::runtime_error("--type '" + type_str + "' cannot be produced from F32 data "
                                           "(no from_float converter), see --help for the supported list");
             }
+            type_was_explicit = true;
             i++; // skip the value too
-            continue;
-        }
-        if (strcmp(argv[i], "--qat") == 0 && i + 1 < argc) {
-            const std::string type_str = argv[i + 1];
-            if (type_str == "q3_k") {
-                out_type = GGML_TYPE_Q3_K;
-            } else if (type_str == "q4_k") {
-                out_type = GGML_TYPE_Q4_K;
-            } else if (type_str == "q4_0") {
-                out_type = GGML_TYPE_Q4_0;
-            } else {
-                throw std::runtime_error("unknown --qat '" + type_str + "', valid values: q3_k, q4_k, q4_0");
-            }
-            i++;
             continue;
         }
         filtered.push_back(argv[i]);
@@ -642,18 +632,26 @@ int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;
+    ggml_type out_type = GGML_TYPE_F16;
+    bool output_type_explicit = false;
 
     params.out_file = "ggml-lora-merged-f16.gguf";
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_EXPORT_LORA, print_usage)) {
-        return 1;
-    }
-
-    g_verbose = (params.verbosity > 1);
     try {
-        lora_merge_ctx ctx(params.model.path, params.lora_adapters, params.out_file, params.cpuparams.n_threads);
+        auto filtered_args = extract_type_arg(argc, argv, out_type, output_type_explicit);
+        std::vector<char *> filtered_argv;
+        filtered_argv.reserve(filtered_args.size());
+        for (auto & arg : filtered_args) {
+            filtered_argv.push_back(arg.data());
+        }
+        if (!common_params_parse((int) filtered_argv.size(), filtered_argv.data(), params, LLAMA_EXAMPLE_EXPORT_LORA, print_usage)) {
+            return 1;
+        }
+
+        g_verbose = (params.verbosity > 1);
+        lora_merge_ctx ctx(params.model.path, params.lora_adapters, params.out_file, params.cpuparams.n_threads, out_type, output_type_explicit);
         ctx.run_merge();
     } catch (const std::exception & err) {
         fprintf(stderr, "%s\n", err.what());
