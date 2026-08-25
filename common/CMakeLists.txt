@@ -81,6 +81,8 @@ add_library(${TARGET}
     imatrix-loader.cpp
     imatrix-loader.h
     json-schema-to-grammar.cpp
+    json.cpp
+    json.h
     jsonl.cpp
     jsonl.h
     llguidance.cpp

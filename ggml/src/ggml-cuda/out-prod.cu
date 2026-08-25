@@ -76,8 +76,6 @@ void ggml_cuda_out_prod(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const float alpha = 1.0f;
     const float beta = 0.0f;
 
-    CUBLAS_CHECK(cublasSetStream(handle, stream));
-
     const int64_t ldc = nb1  / sizeof(float);
 
     const bool src1_T = ggml_is_transposed(src1);
