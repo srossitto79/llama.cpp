@@ -21,6 +21,8 @@
 
 This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp), kept in sync with upstream via regular merges, that adds the following on top of it:
 
+Try it with [llama-mantle](https://github.com/srossitto79/llama-mantle), our fork of llama-swap. It adds models and datasets management/search/download, a model configuration UI, backend management/download/building, and access to the full llama.cpp toolset, including QLoRA training.
+
 ### MoE expert pruning — `llama-prune`
 
 Static (hard) and dynamic (soft) expert pruning for Gemma 4 26B A4B MoE checkpoints, using the REAP saliency criterion ([arXiv:2510.13999](https://arxiv.org/abs/2510.13999)). Soft pruning disables experts at inference time via router-logit masking without touching any weights; hard pruning compacts the GGUF to physically remove them. See [docs/moe-pruning.md](docs/moe-pruning.md).
