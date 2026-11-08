@@ -900,6 +900,10 @@ void process_shaders() {
         string_to_spv("cpy_f32_" + t, "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"S_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         string_to_spv("cpy_" + t + "_f32", "copy_from_quant_k.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     }
+    // dequantize only: the MUL_MAT_ID backward pass casts quantized expert stacks to F32
+    for (std::string t : {"q2_k", "q5_k", "q6_k"}) {
+        string_to_spv("cpy_" + t + "_f32", "copy_from_quant_k.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
+    }
     string_to_spv("cpy_f32_mxfp4", "copy_to_quant.comp", {{"DATA_A_MXFP4", "1"}, {"S_TYPE", "float"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     string_to_spv("cpy_mxfp4_f32", "copy_from_quant.comp", {{"DATA_A_MXFP4", "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
 

@@ -1,7 +1,8 @@
 // Backward pass of the ops the MoE FFN uses in training, checked against reference gradients:
 //   - GET_ROWS with batched rows, as the router selects the probabilities of the top-k experts
 //     (the indices are a view of the argsort result, as ggml_top_k returns them)
-//   - MUL_MAT_ID with src1 broadcast over the expert slots, as the gate/up projections use it
+//   - MUL_MAT_ID with src1 broadcast over the expert slots, as the gate/up projections use it,
+//     with F32 experts and with quantized (frozen) experts, whose src1 gradient must still flow
 //
 // The gradient graph is built by ggml.c and computed on the CPU backend.
 
@@ -9,6 +10,7 @@
 #include "ggml-cpu.h"
 
 #include <cmath>
+#include <initializer_list>
 #include <cstdio>
 #include <vector>
 
@@ -85,18 +87,28 @@ static void test_get_rows_batched(bool rows_view) {
 
 // as [K, M, E], b [K, nb1, T] with nb1 = 1 (broadcast) or n_used, ids [n_used, T]
 //   out[m, i, t] = sum_k as[k, m, ids[i, t]] * b[k, i % nb1, t]
-static void test_mul_mat_id(bool broadcast) {
-    const int K = 4, M = 3, E = 4, n_used = 2, T = 3;
+// A quantized as is frozen: only grad(b) is checked, against the dequantized weights.
+static void test_mul_mat_id(bool broadcast, ggml_type type) {
+    const bool quantized = ggml_is_quantized(type);
+    const int K = quantized ? (int) ggml_blck_size(type) : 4, M = 3, E = 4, n_used = 2, T = 3;
     const int nb1 = broadcast ? 1 : n_used;
 
     ggml_init_params params = { 16 * 1024 * 1024, nullptr, false };
     ggml_context * ctx = ggml_init(params);
 
-    ggml_tensor * as = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, M, E);
+    ggml_tensor * as_f32 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, M, E);
+    fill(as_f32, 0.05f);
+    ggml_tensor * as = as_f32;
+    if (quantized) {
+        as = ggml_new_tensor_3d(ctx, type, K, M, E);
+        ggml_quantize_chunk(type, data_f32(as_f32), as->data, 0, M*E, K, nullptr);
+        ggml_get_type_traits(type)->to_float(as->data, data_f32(as_f32), K*M*E); // reference weights
+    } else {
+        ggml_set_param(as);
+    }
+
     ggml_tensor * b  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, K, nb1, T);
-    ggml_set_param(as);
     ggml_set_param(b);
-    fill(as, 0.05f);
     fill(b, 0.2f);
 
     ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, T);
@@ -122,13 +134,24 @@ static void test_mul_mat_id(bool broadcast) {
                 const float g = data_f32(w)[(t*n_used + i)*M + mm];
                 for (int k = 0; k < K; ++k) {
                     ref_as[(e*M + mm)*K + k] += data_f32(b)[(t*nb1 + j)*K + k] * g;
-                    ref_b[(t*nb1 + j)*K + k] += data_f32(as)[(e*M + mm)*K + k] * g;
+                    ref_b[(t*nb1 + j)*K + k] += data_f32(as_f32)[(e*M + mm)*K + k] * g;
                 }
             }
         }
     }
-    check(broadcast ? "MUL_MAT_ID broadcast src1: grad(as)" : "MUL_MAT_ID: grad(as)", ggml_graph_get_grad(gb, as), ref_as);
-    check(broadcast ? "MUL_MAT_ID broadcast src1: grad(b)"  : "MUL_MAT_ID: grad(b)",  ggml_graph_get_grad(gb, b),  ref_b);
+    char name[96];
+    if (!quantized) {
+        snprintf(name, sizeof(name), "MUL_MAT_ID%s: grad(as)", broadcast ? " broadcast src1" : "");
+        check(name, ggml_graph_get_grad(gb, as), ref_as);
+    }
+    snprintf(name, sizeof(name), "MUL_MAT_ID %s%s: grad(b)", ggml_type_name(type), broadcast ? " broadcast src1" : "");
+    ggml_tensor * grad_b = ggml_graph_get_grad(gb, b);
+    if (grad_b == nullptr) {
+        printf("%-50s no gradient FAIL\n", name);
+        n_failed++;
+    } else {
+        check(name, grad_b, ref_b);
+    }
 
     ggml_free(ctx);
 }
@@ -136,8 +159,10 @@ static void test_mul_mat_id(bool broadcast) {
 int main() {
     test_get_rows_batched(false);
     test_get_rows_batched(true);
-    test_mul_mat_id(false);
-    test_mul_mat_id(true);
+    for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K }) {
+        test_mul_mat_id(false, type);
+        test_mul_mat_id(true,  type);
+    }
 
     if (n_failed > 0) {
         printf("%d check(s) failed\n", n_failed);

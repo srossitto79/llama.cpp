@@ -7196,7 +7196,10 @@ static void ggml_compute_backward(
             //   grad_as[:,:,e] += sum_{(i,t): ids[i,t]==e} b[:,i,t] ⊗ grad[:,i,t]
             //   → computed via OUT_PROD_ID
             //
-            // Quantized src0 is frozen (stop-gradient) — handled in grads_needed below.
+            // Quantized src0 is frozen (no gradient, see ignore_src below), but the gradient
+            // still flows to src1 so LoRA weights before the MoE FFN learn through it: the
+            // expert stack is dequantized to F32 for the transpose, a transient buffer of
+            // cols*rows*n_expert floats.
             // src1 may be broadcast over the expert slots, [cols, 1, n_tokens], as the
             // gate/up projections of the MoE FFN do: expand it for OUT_PROD_ID and sum
             // its gradient back over the slots.
@@ -7211,7 +7214,8 @@ static void ggml_compute_backward(
             }
             if (src1_needs_grads) {
                 // Transpose expert matrices: as [cols, rows, n_expert] → as_T [rows, cols, n_expert]
-                struct ggml_tensor * as_T = ggml_cont(ctx, ggml_permute(ctx, src0, 1, 0, 2, 3));
+                struct ggml_tensor * as = ggml_is_quantized(src0->type) ? ggml_cast(ctx, src0, GGML_TYPE_F32) : src0;
+                struct ggml_tensor * as_T = ggml_cont(ctx, ggml_permute(ctx, as, 1, 0, 2, 3));
                 struct ggml_tensor * grad_b = ggml_mul_mat_id(ctx, as_T, grad, src2);
                 if (!ggml_are_same_shape(src1, grad_b)) {
                     grad_b = ggml_repeat_back(ctx, grad_b, src1);
@@ -7767,12 +7771,10 @@ void ggml_build_backward_expand(
                 break;
 
             // MUL_MAT_ID: expert dispatch indices (src2) are integer — no gradient.
-            // When src0 is quantized the expert weights are frozen, so stop gradient through
-            // both src0 and src1 (activations have no path to loss without differentiable weights).
+            // Quantized expert weights are frozen; the activations (src1) still get a gradient.
             case GGML_OP_MUL_MAT_ID:
                 if (ggml_is_quantized(node->src[0]->type)) {
                     ignore_src[0] = true;
-                    ignore_src[1] = true;
                 }
                 ignore_src[2] = true; // ids: integer tensor
                 break;

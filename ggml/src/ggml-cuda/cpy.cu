@@ -1,6 +1,7 @@
 #include "cpy.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
+#include "convert.cuh"
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
 #include "ggml-musa/mudnn.cuh"
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
@@ -463,6 +464,14 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         ggml_is_contiguous(src1);
 
     size_t mc_width = 0, mc_height = 0, mc_spitch = 0, mc_dpitch = 0;
+
+    if (contiguous_srcs && ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32) {
+        // dequantize any type: the MUL_MAT_ID backward pass casts quantized expert stacks to F32
+        const to_fp32_cuda_t to_fp32 = ggml_get_to_fp32_cuda(src0->type);
+        GGML_ASSERT(to_fp32 != nullptr);
+        to_fp32(src0_ddc, (float *) src1_ddc, ne, main_stream);
+        return;
+    }
 
     if (src0->type == src1->type && contiguous_srcs) {
         GGML_ASSERT(ggml_nbytes(src0) == ggml_nbytes(src1));

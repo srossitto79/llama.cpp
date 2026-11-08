@@ -355,7 +355,7 @@ llama_build_and_test(test-moe-backward.cpp)
 if (LLAMA_BUILD_EXAMPLES AND LLAMA_BUILD_TOOLS)
     # model:quantization; each case trains on the CPU (ngl 0) and on the default GPU backend
     # (ngl 99) and requires the same losses, so a CPU-only build compares the CPU with itself
-    foreach(qlora_case llama-dense:f32 llama-moe:f32 llama-moe:q4_0)
+    foreach(qlora_case llama-dense:f32 llama-moe:f32 llama-moe:q4_0 llama-moe:q4_k)
         string(REPLACE ":" ";" qlora_case "${qlora_case}")
         list(GET qlora_case 0 qlora_model)
         list(GET qlora_case 1 qlora_quant)
