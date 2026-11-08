@@ -280,6 +280,9 @@ struct file_input {
         auto offset = gguf_get_data_offset(ctx_ggufs[file_idx]) + gguf_get_tensor_offset(ctx_ggufs[file_idx], i_tensor_in);
         f_ins[file_idx]->seekg(offset);
         f_ins[file_idx]->read((char *) buf.data(), len);
+        if (!*f_ins[file_idx]) {
+            throw std::runtime_error("failed to read data for tensor " + name + ", input file may be truncated");
+        }
     }
 
     ~file_input() {
@@ -357,11 +360,14 @@ struct lora_merge_ctx {
     }
 
     ggml_type get_out_tensor_type(struct ggml_tensor * t) {
-        // Preserve the historical default: F32 tensors stay F32 and all
-        // other tensors are written as F16. An explicit --type requests a
+        // Default: F32 and BF16 tensors keep their type and all other
+        // tensors are written as F16. An explicit --type requests a
         // uniform output type wherever the tensor shape supports it.
         if (!output_type_explicit) {
-            return t->type == GGML_TYPE_F32 ? GGML_TYPE_F32 : GGML_TYPE_F16;
+            if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_BF16) {
+                return t->type;
+            }
+            return GGML_TYPE_F16;
         }
         if (t->ne[0] % ggml_blck_size(out_type) != 0) {
             return t->type;

@@ -355,7 +355,7 @@ evaluation_result evaluate(
     const int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(context)));
     const auto started = std::chrono::steady_clock::now();
     auto last_progress = started;
-    llama_batch batch = llama_batch_init(opts.n_batch, 0, 1);
+    common_batch batch(context);
     for (size_t record_index = 0; record_index < dataset.records.size(); ++record_index) {
         const llama_prune_dataset_record & record = dataset.records[record_index];
         for (size_t window_start = 0; window_start + 1 < record.tokens.size(); window_start += opts.n_ctx) {
@@ -363,16 +363,15 @@ evaluation_result evaluate(
             llama_memory_clear(llama_get_memory(context), true);
             for (size_t batch_start = window_start; batch_start + 1 < window_end; batch_start += opts.n_batch) {
                 const size_t batch_end = std::min(window_end - 1, batch_start + (size_t) opts.n_batch);
-                common_batch_clear(batch);
+                batch.clear();
                 std::vector<size_t> targets;
                 for (size_t i = batch_start; i < batch_end; ++i) {
                     bool need_logits = false;
                     for (size_t mask = 0; mask < 4; ++mask) need_logits |= llama_prune_token_is_evaluated(record, i + 1, (llama_prune_ppl_mask) mask);
-                    common_batch_add(batch, record.tokens[i], (llama_pos) (i - window_start), { 0 }, need_logits);
+                    batch.add(record.tokens[i], (llama_pos) (i - window_start), 0, need_logits);
                     if (need_logits) targets.push_back(i + 1);
                 }
-                if (llama_decode(context, batch) != 0) {
-                    llama_batch_free(batch);
+                if (llama_process(context, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
                     throw std::runtime_error("model evaluation failed at JSONL line " + std::to_string(record.line));
                 }
                 const float * logits = llama_get_logits(context);
@@ -386,7 +385,7 @@ evaluation_result evaluate(
                         }
                     }
                 }
-                result.processed_tokens += batch.n_tokens;
+                result.processed_tokens += batch.size();
                 const auto now = std::chrono::steady_clock::now();
                 if (now - last_progress >= std::chrono::seconds(5)) {
                     std::cerr << "llama-prune: " << label << ": record " << record_index + 1 << '/' << dataset.records.size()
@@ -396,7 +395,6 @@ evaluation_result evaluate(
             }
         }
     }
-    llama_batch_free(batch);
     result.elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     result.throughput = result.elapsed_seconds == 0.0 ? 0.0 : result.processed_tokens / result.elapsed_seconds;
     result.invalid_routing = collector.invalid_routing;

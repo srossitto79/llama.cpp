@@ -353,7 +353,7 @@ static std::string apply_qlora_chat_template(
     inputs.tool_choice = COMMON_CHAT_TOOL_CHOICE_NONE;
     inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     inputs.enable_thinking = false;
-    return common_chat_templates_apply(tmpls, inputs).prompt;
+    return common_chat_templates_apply(tmpls, inputs).prompt.str();
 }
 
 struct jsonl_message_task {
