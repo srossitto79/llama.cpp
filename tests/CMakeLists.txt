@@ -347,6 +347,39 @@ target_sources(test-moe-prune PRIVATE ../tools/llama-prune/dataset.cpp ../tools/
 target_include_directories(test-moe-prune PRIVATE ../tools/llama-prune ${CMAKE_SOURCE_DIR}/ggml/include)
 target_compile_definitions(test-moe-prune PRIVATE LLAMA_PRUNE_TEST_GEMMA_VOCAB="${CMAKE_SOURCE_DIR}/models/ggml-vocab-gemma-4.gguf")
 
+# backward pass of the MoE FFN ops (batched GET_ROWS, broadcast MUL_MAT_ID) against reference gradients
+llama_build_and_test(test-moe-backward.cpp)
+
+# QLoRA end to end on the generated dummy models: train, infer with the adapter, merge, infer.
+# tests/ is added before examples/ and tools/, so gate on the options rather than on the targets.
+if (LLAMA_BUILD_EXAMPLES AND LLAMA_BUILD_TOOLS)
+    # model:quantization; each case trains on the CPU (ngl 0) and on the default GPU backend
+    # (ngl 99) and requires the same losses, so a CPU-only build compares the CPU with itself
+    foreach(qlora_case llama-dense:f32 llama-moe:f32 llama-moe:q4_0)
+        string(REPLACE ":" ";" qlora_case "${qlora_case}")
+        list(GET qlora_case 0 qlora_model)
+        list(GET qlora_case 1 qlora_quant)
+        set(qlora_name test-qlora-finetune-${qlora_model}-${qlora_quant})
+        if (qlora_quant STREQUAL "f32")
+            set(qlora_quant "")
+        endif()
+        add_test(NAME ${qlora_name}
+            COMMAND ${CMAKE_COMMAND}
+                -DFINETUNE=$<TARGET_FILE:llama-finetune-qlora>
+                -DCOMPLETION=$<TARGET_FILE:llama-completion>
+                -DEXPORT_LORA=$<TARGET_FILE:llama-export-lora>
+                -DQUANTIZE=$<TARGET_FILE:llama-quantize>
+                -DMODEL=${MODEL_DIR}/${qlora_model}.gguf
+                -DQUANT=${qlora_quant}
+                -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/${qlora_name}
+                -DNGL=0,99
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/test-qlora-finetune.cmake)
+        set_tests_properties(${qlora_name} PROPERTIES
+            LABELS "main backend"
+            FIXTURES_REQUIRED generate-models)
+    endforeach()
+endif()
+
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp  LABEL "main behavior backend"  LINK ggml)

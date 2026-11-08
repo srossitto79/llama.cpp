@@ -4100,14 +4100,12 @@ struct ggml_tensor * ggml_get_rows_back(
     GGML_ASSERT(b->type == GGML_TYPE_I32);
     GGML_ASSERT(a->ne[0] == c->ne[0]);
 
-    // Support both 2D and 3D: result shape matches c (the source tensor shape)
+    // the backends implement the 2D case only; batched GET_ROWS is flattened by its backward pass
+    GGML_ASSERT(c->ne[2] == 1 && c->ne[3] == 1);
+
     // TODO: implement non F32 return
-    struct ggml_tensor * result;
-    if (c->ne[2] > 1) {
-        result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, c->ne[0], c->ne[1], c->ne[2]);
-    } else {
-        result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c->ne[0], c->ne[1]);
-    }
+    //struct ggml_tensor * result = ggml_new_tensor_2d(ctx, a->type, a->ne[0], b->ne[0]);
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, c->ne[0], c->ne[1]);
 
     result->op     = GGML_OP_GET_ROWS_BACK;
     result->src[0] = a;
@@ -7199,15 +7197,25 @@ static void ggml_compute_backward(
             //   → computed via OUT_PROD_ID
             //
             // Quantized src0 is frozen (stop-gradient) — handled in grads_needed below.
+            // src1 may be broadcast over the expert slots, [cols, 1, n_tokens], as the
+            // gate/up projections of the MoE FFN do: expand it for OUT_PROD_ID and sum
+            // its gradient back over the slots.
             if (src0_needs_grads) {
                 const int64_t n_expert = src0->ne[2];
-                struct ggml_tensor * grad_as = ggml_out_prod_id(ctx, src1, grad, src2, n_expert);
+                struct ggml_tensor * b = src1;
+                if (b->ne[1] != grad->ne[1]) {
+                    b = ggml_repeat_4d(ctx, b, b->ne[0], grad->ne[1], b->ne[2], b->ne[3]);
+                }
+                struct ggml_tensor * grad_as = ggml_out_prod_id(ctx, b, grad, src2, n_expert);
                 ggml_add_or_set(ctx, cgraph, isrc0, grad_as);
             }
             if (src1_needs_grads) {
                 // Transpose expert matrices: as [cols, rows, n_expert] → as_T [rows, cols, n_expert]
                 struct ggml_tensor * as_T = ggml_cont(ctx, ggml_permute(ctx, src0, 1, 0, 2, 3));
                 struct ggml_tensor * grad_b = ggml_mul_mat_id(ctx, as_T, grad, src2);
+                if (!ggml_are_same_shape(src1, grad_b)) {
+                    grad_b = ggml_repeat_back(ctx, grad_b, src1);
+                }
                 ggml_add_or_set(ctx, cgraph, isrc1, grad_b);
             }
         } break;
@@ -7321,8 +7329,28 @@ static void ggml_compute_backward(
             }
         } break;
         case GGML_OP_GET_ROWS: {
-            if (src0_needs_grads) {
+            if (src0_needs_grads && src0->ne[2] == 1 && src0->ne[3] == 1) {
                 ggml_add_or_set(ctx, cgraph, isrc0, ggml_get_rows_back(ctx, grad, src1, src0));
+            } else if (src0_needs_grads) {
+                // Batched rows, as the MoE router selects its probabilities:
+                //   src0 [ne0, ne1, nb], src1 [n, nb], tensor[:, i, t] = src0[:, src1[i, t], t]
+                // Offset the indices of batch t by t*ne1 and scatter into the flattened
+                // [ne0, ne1*nb] gradient with the 2D GET_ROWS_BACK.
+                GGML_ASSERT(src0->ne[3] == 1 && src1->ne[1] == src0->ne[2] && src1->ne[2] == 1 && src1->ne[3] == 1);
+                const int64_t ne0 = src0->ne[0];
+                const int64_t ne1 = src0->ne[1];
+                const int64_t nb  = src0->ne[2];
+                const int64_t n   = src1->ne[0];
+
+                struct ggml_tensor * offs = ggml_scale(ctx, ggml_arange(ctx, 0.0f, (float) nb, 1.0f), (float) ne1);
+                offs = ggml_reshape_2d(ctx, offs, 1, nb);
+                struct ggml_tensor * ids = ggml_add(ctx, ggml_cast(ctx, src1, GGML_TYPE_F32), offs);
+                ids = ggml_reshape_1d(ctx, ggml_cast(ctx, ids, GGML_TYPE_I32), n*nb);
+
+                struct ggml_tensor * grad_2d = ggml_reshape_2d(ctx, ggml_cont(ctx, grad), ne0, n*nb);
+                struct ggml_tensor * shape   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1*nb);
+                struct ggml_tensor * grad_rows = ggml_get_rows_back(ctx, grad_2d, ids, shape);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_reshape_3d(ctx, grad_rows, ne0, ne1, nb));
             }
             if (src1_needs_grads) {
                 // noop
