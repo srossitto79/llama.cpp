@@ -347,8 +347,11 @@ target_sources(test-moe-prune PRIVATE ../tools/llama-prune/dataset.cpp ../tools/
 target_include_directories(test-moe-prune PRIVATE ../tools/llama-prune ${CMAKE_SOURCE_DIR}/ggml/include)
 target_compile_definitions(test-moe-prune PRIVATE LLAMA_PRUNE_TEST_GEMMA_VOCAB="${CMAKE_SOURCE_DIR}/models/ggml-vocab-gemma-4.gguf")
 
-# backward pass of the MoE FFN ops (batched GET_ROWS, broadcast MUL_MAT_ID) against reference gradients
-llama_build_and_test(test-moe-backward.cpp)
+# backward pass of the MoE FFN ops (batched GET_ROWS, broadcast MUL_MAT_ID) against reference gradients;
+# it calls the CPU backend directly, so it cannot be built with dynamic loading
+if (NOT GGML_BACKEND_DL AND GGML_CPU)
+    llama_build_and_test(test-moe-backward.cpp)
+endif()
 
 # QLoRA end to end on the generated dummy models: train, infer with the adapter, merge, infer.
 # tests/ is added before examples/ and tools/, so gate on the conditions that build the targets

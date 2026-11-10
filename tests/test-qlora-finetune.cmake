@@ -87,6 +87,7 @@ foreach(ngl IN LISTS NGL_LIST)
     string(REGEX MATCHALL "epoch [0-9]+/[0-9]+: train_loss=[^ ]+" loss_lines "${STEP_OUTPUT}")
     list(LENGTH loss_lines n_loss)
     if (NOT n_loss EQUAL EPOCHS)
+        message("${STEP_OUTPUT}")
         message(FATAL_ERROR "ngl=${ngl}: expected ${EPOCHS} train_loss lines, found ${n_loss}")
     endif()
 

@@ -827,7 +827,6 @@ static ggml_opt_dataset_t build_dataset(
     for (int64_t i = 0; i < ndata; ++i) {
         const int64_t off = i * stride;
         float reward_sum = 0.0f;
-        int64_t reward_count = 0;
         for (int32_t j = 0; j < n_ctx; ++j) {
             const int64_t idx = off + j;
             if (idx >= n_tokens) {
@@ -849,7 +848,6 @@ static ggml_opt_dataset_t build_dataset(
             if (flat_labels[idx] >= 0) {
                 ++n_labels;
                 reward_sum += flat_rewards[idx];
-                ++reward_count;
                 if (critical_enabled) {
                     critical_metadata[i * n_ctx + j] = { flat_span_weights[idx], flat_rewards[idx] };
                 }
@@ -1808,6 +1806,11 @@ static int run_grpo_mode(
 // ---------------------------------------------------------------------------
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
+
+    // the log worker is never torn down, pending messages (the last epoch's loss) are lost at exit without a flush
+    struct log_flush_guard {
+        ~log_flush_guard() { common_log_flush(common_log_main()); }
+    } log_flush;
 
     common_params params;
     params.escape = false;
