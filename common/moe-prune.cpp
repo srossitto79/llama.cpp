@@ -32,6 +32,7 @@ extern "C" {
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <set>
@@ -61,19 +62,18 @@ void hash_bytes(sha256_t & hash, const void * data, size_t size) {
     sha256_update(&hash, static_cast<const unsigned char *>(data), size);
 }
 
+// tensors hashed into expert_tensor_hash; ffn_gate_inp.scale (Gemma 4, [n_embd]) is not per expert,
+// it stays in the hash so profiles written before the generic version still validate
 bool is_expert_identity_tensor(const std::string & name) {
-    if (name.find(".ffn_gate_inp.weight") != std::string::npos || name.find(".ffn_gate_inp.scale") != std::string::npos) {
-        return true;
-    }
-    return name.find(".ffn_gate_up_exps.") != std::string::npos ||
-           name.find(".ffn_gate_exps.") != std::string::npos ||
-           name.find(".ffn_up_exps.") != std::string::npos ||
-           name.find(".ffn_down_exps.") != std::string::npos;
+    return common_moe_prune_is_expert_tensor(name) || name.find(".ffn_gate_inp.scale") != std::string::npos;
 }
 
-int32_t metadata_i32(const gguf_context * ctx, const std::string & key) {
+int32_t metadata_i32(const gguf_context * ctx, const std::string & key, int32_t fallback = -1) {
     const int64_t id = gguf_find_key(ctx, key.c_str());
     if (id < 0) {
+        if (fallback >= 0) {
+            return fallback;
+        }
         throw std::runtime_error("missing GGUF metadata: " + key);
     }
     switch (gguf_get_kv_type(ctx, id)) {
@@ -97,7 +97,7 @@ void write_json_atomic(const json & value, const std::string & path) {
             throw std::runtime_error("failed to write output: " + tmp);
         }
     }
-    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+    if (!common_moe_prune_replace_file(tmp, path)) {
         std::remove(tmp.c_str());
         throw std::runtime_error("failed to replace output: " + path);
     }
@@ -105,8 +105,21 @@ void write_json_atomic(const json & value, const std::string & path) {
 
 }
 
-bool common_moe_prune_is_supported_architecture(const std::string & architecture, int32_t layer_count) {
-    return architecture == COMMON_MOE_PRUNE_GEMMA4_ARCHITECTURE && layer_count == COMMON_MOE_PRUNE_GEMMA4_LAYER_COUNT;
+// rename that replaces an existing destination (std::rename fails on Windows when it exists)
+bool common_moe_prune_replace_file(const std::string & from, const std::string & to) {
+    std::error_code ec;
+    std::filesystem::rename(from, to, ec);
+    return !ec;
+}
+
+bool common_moe_prune_is_expert_tensor(const std::string & name) {
+    auto ends_with = [&](const char * suffix) {
+        const size_t n = strlen(suffix);
+        return name.size() >= n && name.compare(name.size() - n, n, suffix) == 0;
+    };
+    return ends_with(".ffn_gate_inp.weight") || ends_with(".ffn_gate_inp.bias") ||
+           name.find(".exp_probs_b") != std::string::npos ||
+           name.find("exps.") != std::string::npos; // ffn_{gate,up,gate_up,down}_exps, *_chexps
 }
 
 double common_moe_prune_expert_stats::mean_probability() const {
@@ -157,18 +170,16 @@ common_moe_prune_model_info common_moe_prune_inspect_model(const std::string & p
 
     common_moe_prune_model_info result;
     result.architecture = gguf_get_val_str(ctx.get(), arch_id);
-    if (result.architecture != COMMON_MOE_PRUNE_GEMMA4_ARCHITECTURE) {
-        throw std::runtime_error("unsupported architecture: MoE pruning supports Gemma 4 26B A4B only");
+    const std::string & arch = result.architecture;
+    result.layer_count = metadata_i32(ctx.get(), arch + ".block_count");
+    if (gguf_find_key(ctx.get(), (arch + ".expert_count").c_str()) < 0) {
+        throw std::runtime_error("not a MoE model: " + arch + ".expert_count is missing");
     }
-    result.layer_count = metadata_i32(ctx.get(), "gemma4.block_count");
-    if (!common_moe_prune_is_supported_architecture(result.architecture, result.layer_count)) {
-        throw std::runtime_error("unsupported Gemma 4 variant: expected " +
-            std::to_string(COMMON_MOE_PRUNE_GEMMA4_LAYER_COUNT) + " layers for 26B A4B");
-    }
-    result.expert_count = metadata_i32(ctx.get(), "gemma4.expert_count");
-    result.experts_used = metadata_i32(ctx.get(), "gemma4.expert_used_count");
+    result.expert_count = metadata_i32(ctx.get(), arch + ".expert_count");
+    result.experts_used = metadata_i32(ctx.get(), arch + ".expert_used_count");
+    result.expert_group_count = std::max(1, metadata_i32(ctx.get(), arch + ".expert_group_count", 1));
     if (result.expert_count <= 0 || result.experts_used <= 0 || result.experts_used > result.expert_count) {
-        throw std::runtime_error("invalid Gemma 4 expert metadata");
+        throw std::runtime_error("invalid expert metadata for " + arch);
     }
 
     struct expert_tensor_span {
@@ -201,7 +212,7 @@ common_moe_prune_model_info common_moe_prune_inspect_model(const std::string & p
         result.expert_bytes += size;
     }
     if (moe_layers.empty()) {
-        throw std::runtime_error("Gemma 4 model has no routed expert tensors");
+        throw std::runtime_error("model has no stacked routed expert tensors (blk.N.ffn_*_exps)");
     }
     result.moe_layers.assign(moe_layers.begin(), moe_layers.end());
 

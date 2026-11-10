@@ -7,17 +7,15 @@
 #include <string>
 #include <vector>
 
-// Static MoE pruning (common/moe-prune.cpp and tools/llama-prune/) currently supports exactly one
-// checkpoint family: the Gemma 4 26B A4B Q4_0 QAT GGUF layout loaded by src/models/gemma4.cpp.
-// common_moe_prune_is_supported_architecture() is the single source of truth for that check on the
-// GGUF-metadata side (common/moe-prune.cpp, tools/llama-prune/hard-prune.cpp). The runtime soft-prune
-// path in src/llama-model.cpp cannot depend on common/, so it re-expresses the same constraint via
-// LLM_ARCH_GEMMA4 / LLM_TYPE_26B_A4B (llama_model_set_moe_prune) — keep that check's layer-count
-// assumption in sync with COMMON_MOE_PRUNE_GEMMA4_LAYER_COUNT when either changes.
-constexpr const char * COMMON_MOE_PRUNE_GEMMA4_ARCHITECTURE = "gemma4";
-constexpr int32_t COMMON_MOE_PRUNE_GEMMA4_LAYER_COUNT = 30;
+// Static MoE pruning (common/moe-prune.cpp and tools/llama-prune/) works on any GGUF whose routed
+// experts are stacked tensors (blk.N.ffn_*_exps.*) with a router blk.N.ffn_gate_inp.weight, and whose
+// metadata has <arch>.block_count, <arch>.expert_count and <arch>.expert_used_count.
+// The soft-prune mask is applied in llm_graph_context::build_moe_ffn, so it covers the architectures
+// that route through it; llama-prune fails if a disabled expert is still selected.
 
-bool common_moe_prune_is_supported_architecture(const std::string & architecture, int32_t layer_count);
+// true for the tensors that carry one slice per routed expert: router weight and bias,
+// expert selection bias, and the stacked expert tensors
+bool common_moe_prune_is_expert_tensor(const std::string & name);
 
 struct common_moe_prune_layer {
     std::vector<int32_t> disabled_experts;
@@ -47,6 +45,7 @@ struct common_moe_prune_model_info {
     int32_t layer_count = 0;
     int32_t expert_count = 0;
     int32_t experts_used = 0;
+    int32_t expert_group_count = 1; // grouped routing (DeepSeek V3 style) when > 1
     std::vector<int32_t> moe_layers;
     uint64_t expert_bytes = 0;
 };
@@ -67,6 +66,7 @@ struct common_moe_prune_expert_stats {
 using common_moe_prune_stats = std::map<int32_t, std::vector<common_moe_prune_expert_stats>>;
 
 std::string common_moe_prune_sha256_file(const std::string & path);
+bool common_moe_prune_replace_file(const std::string & from, const std::string & to);
 common_moe_prune_model_info common_moe_prune_inspect_model(const std::string & path);
 common_moe_prune_profile common_moe_prune_profile_load(const std::string & path);
 void common_moe_prune_profile_write(const common_moe_prune_profile & profile, const std::string & path);

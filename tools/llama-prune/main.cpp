@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -61,6 +62,7 @@ struct route_layer_state {
     std::vector<float> probabilities;
     int64_t n_used = 0;
     int64_t n_tokens = 0;
+    bool pending = false; // routing of the current ubatch not yet added to the statistics
 };
 
 struct route_collector {
@@ -71,6 +73,8 @@ struct route_collector {
     uint64_t invalid_routing = 0;
     double entropy_sum = 0.0;
     uint64_t entropy_tokens = 0;
+    std::map<int32_t, std::vector<bool>> disabled; // soft-pruned experts per layer
+    uint64_t disabled_selected = 0;                // selections of a soft-pruned expert
 };
 
 struct evaluation_result {
@@ -211,91 +215,163 @@ int32_t tensor_layer(const char * name, const char * prefix) {
     return sscanf(name, pattern.c_str(), &layer) == 1 ? layer : -1;
 }
 
-std::vector<uint8_t> tensor_bytes(ggml_tensor * tensor) {
-    std::vector<uint8_t> result(ggml_nbytes(tensor));
-    if (ggml_backend_buffer_is_host(tensor->buffer)) {
-        memcpy(result.data(), tensor->data, result.size());
-    } else {
-        ggml_backend_tensor_get(tensor, result.data(), 0, result.size());
+// Host copy of an intercepted tensor, read by element index in ne order. Some of them are strided
+// views: ffn_moe_topk keeps the row stride of the full argsort (n_expert, not n_expert_used).
+class tensor_reader {
+public:
+    explicit tensor_reader(ggml_tensor * tensor) : tensor(tensor), contiguous(ggml_is_contiguous(tensor)), data(ggml_nbytes(tensor)) {
+        if (tensor->type != GGML_TYPE_F32 && tensor->type != GGML_TYPE_F16 && tensor->type != GGML_TYPE_BF16 && tensor->type != GGML_TYPE_I32) {
+            throw std::runtime_error(std::string("unsupported calibration tensor type: ") + ggml_type_name(tensor->type));
+        }
+        if (ggml_backend_buffer_is_host(tensor->buffer)) {
+            memcpy(data.data(), tensor->data, data.size());
+        } else {
+            ggml_backend_tensor_get(tensor, data.data(), 0, data.size());
+        }
     }
-    return result;
-}
 
-float tensor_float(const std::vector<uint8_t> & data, ggml_type type, size_t index) {
-    if (type == GGML_TYPE_F32) return reinterpret_cast<const float *>(data.data())[index];
-    if (type == GGML_TYPE_F16) return ggml_fp16_to_fp32(reinterpret_cast<const ggml_fp16_t *>(data.data())[index]);
-    if (type == GGML_TYPE_BF16) return ggml_bf16_to_fp32(reinterpret_cast<const ggml_bf16_t *>(data.data())[index]);
-    throw std::runtime_error(std::string("unsupported calibration tensor type: ") + ggml_type_name(type));
-}
+    float f32(size_t index) const {
+        const uint8_t * p = data.data() + offset(index);
+        switch (tensor->type) {
+            case GGML_TYPE_F16:  return ggml_fp16_to_fp32(*reinterpret_cast<const ggml_fp16_t *>(p));
+            case GGML_TYPE_BF16: return ggml_bf16_to_fp32(*reinterpret_cast<const ggml_bf16_t *>(p));
+            default:             return *reinterpret_cast<const float *>(p);
+        }
+    }
 
-// Collects REAP calibration statistics (arXiv:2510.13999) by intercepting three tensors
-// per MoE layer through the ggml eval callback:
+    int32_t i32(size_t index) const {
+        return *reinterpret_cast<const int32_t *>(data.data() + offset(index));
+    }
+
+private:
+    size_t offset(size_t index) const {
+        if (contiguous) return index * ggml_type_size(tensor->type);
+        size_t result = 0;
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            result += (index % tensor->ne[d]) * tensor->nb[d];
+            index /= tensor->ne[d];
+        }
+        return result;
+    }
+
+    const ggml_tensor * tensor;
+    bool contiguous;
+    std::vector<uint8_t> data;
+};
+
+// Collects REAP calibration statistics (arXiv:2510.13999) by intercepting, per MoE layer, through the
+// ggml eval callback:
 //
-//   ffn_moe_topk-{il}         [n_expert_used, n_tokens]          I32 - selected experts
-//   ffn_moe_weights_norm-{il} [1, n_expert_used, n_tokens]       F32 - router probabilities g_j
-//   ffn_moe_down-{il}         [n_embd, n_expert_used, n_tokens]  F32 - expert outputs f_j (pre-gate)
+//   ffn_moe_topk-{il}     [n_expert_used, n_tokens]          I32 - selected experts
+//   ffn_moe_weights*-{il} [1, n_expert_used, n_tokens]       F32 - gate weights g_j; the architecture decides
+//                                                                  which of weights, _softmax, _norm and _scaled
+//                                                                  exist, the last one computed is the applied one
+//   ffn_moe_down-{il}     [n_embd, n_expert_used, n_tokens]  F32 - expert outputs f_j (pre-gate)
+//
+// The routing of a ubatch is added to the statistics when the next ubatch reaches the same layer,
+// or at the end of the evaluation (route_flush_all).
 //
 // Interception scheme adapted from tools/expert-profile on the `feat/moe-expert-profiling`
 // branch by Salvatore Rossitto; see common/moe-prune.cpp for full provenance.
+constexpr std::array<const char *, 4> route_weight_names = {
+    "ffn_moe_weights", "ffn_moe_weights_softmax", "ffn_moe_weights_norm", "ffn_moe_weights_scaled",
+};
+
+int32_t route_weight_layer(const std::string & name) {
+    for (const char * prefix : route_weight_names) {
+        const size_t n = strlen(prefix);
+        if (name.size() > n + 1 && name.compare(0, n, prefix) == 0 && name[n] == '-') {
+            return tensor_layer(name.c_str(), prefix);
+        }
+    }
+    return -1;
+}
+
+void route_flush(route_collector & collector, int32_t layer, route_layer_state & state) {
+    if (!state.pending) return;
+    state.pending = false;
+    if (state.probabilities.size() != state.ids.size()) return;
+    auto & layer_stats = collector.stats[layer];
+    if (layer_stats.empty()) layer_stats.resize(collector.n_expert);
+    const auto disabled = collector.disabled.find(layer);
+    for (int64_t token = 0; token < state.n_tokens; ++token) {
+        double sum = 0.0;
+        for (int64_t slot = 0; slot < state.n_used; ++slot) {
+            const size_t index = token * state.n_used + slot;
+            const int32_t expert = state.ids[index];
+            const float probability = state.probabilities[index];
+            if (expert < 0 || expert >= collector.n_expert || !std::isfinite(probability)) {
+                ++collector.invalid_routing;
+                continue;
+            }
+            if (disabled != collector.disabled.end() && disabled->second[expert]) {
+                ++collector.disabled_selected;
+            }
+            ++layer_stats[expert].selection_count;
+            layer_stats[expert].probability_sum += probability;
+            sum += std::max(0.0f, probability);
+        }
+        if (sum > 0.0) {
+            double entropy = 0.0;
+            for (int64_t slot = 0; slot < state.n_used; ++slot) {
+                const double p = std::max(0.0f, state.probabilities[token * state.n_used + slot]) / sum;
+                if (p > 0.0) entropy -= p * std::log(p);
+            }
+            collector.entropy_sum += entropy;
+            ++collector.entropy_tokens;
+        }
+    }
+}
+
+void route_flush_all(route_collector & collector) {
+    for (auto & item : collector.pending) route_flush(collector, item.first, item.second);
+}
+
+void route_set_disabled(route_collector & collector, const common_moe_prune_profile & profile) {
+    for (const auto & layer : profile.layers) {
+        std::vector<bool> & disabled = collector.disabled[layer.first];
+        disabled.assign(collector.n_expert, false);
+        for (int32_t expert : layer.second.disabled_experts) disabled[expert] = true;
+    }
+}
+
 bool route_callback(ggml_tensor * tensor, bool ask, void * user_data) {
     route_collector & collector = *static_cast<route_collector *>(user_data);
     const std::string name = tensor->name;
-    const bool wanted = name.rfind("ffn_moe_topk-", 0) == 0 || name.rfind("ffn_moe_weights_norm-", 0) == 0 ||
-                        (collector.collect_output_norm && name.rfind("ffn_moe_down-", 0) == 0);
-    if (ask) return wanted;
-    if (!wanted) return true;
+    const bool is_topk = name.rfind("ffn_moe_topk-", 0) == 0;
+    const int32_t weight_layer = is_topk ? -1 : route_weight_layer(name);
+    const bool is_down = collector.collect_output_norm && name.rfind("ffn_moe_down-", 0) == 0;
+    if (ask) return is_topk || weight_layer >= 0 || is_down;
+    if (!is_topk && weight_layer < 0 && !is_down) return true;
 
-    if (name.rfind("ffn_moe_topk-", 0) == 0) {
+    if (is_topk) {
         const int32_t layer = tensor_layer(name.c_str(), "ffn_moe_topk");
         route_layer_state & state = collector.pending[layer];
+        route_flush(collector, layer, state);
         state.n_used = tensor->ne[0];
         state.n_tokens = tensor->ne[1];
-        const std::vector<uint8_t> data = tensor_bytes(tensor);
-        const int32_t * ids = reinterpret_cast<const int32_t *>(data.data());
-        state.ids.assign(ids, ids + state.n_used * state.n_tokens);
+        const tensor_reader ids(tensor);
+        state.ids.resize(state.n_used * state.n_tokens);
+        for (size_t i = 0; i < state.ids.size(); ++i) state.ids[i] = ids.i32(i);
+        state.probabilities.clear();
+        state.pending = true;
         return true;
     }
-    if (name.rfind("ffn_moe_weights_norm-", 0) == 0) {
-        const int32_t layer = tensor_layer(name.c_str(), "ffn_moe_weights_norm");
-        route_layer_state & state = collector.pending[layer];
-        if (state.ids.empty()) return true;
-        const std::vector<uint8_t> data = tensor_bytes(tensor);
-        state.probabilities.resize(state.n_used * state.n_tokens);
-        for (size_t i = 0; i < state.probabilities.size(); ++i) state.probabilities[i] = tensor_float(data, tensor->type, i);
-        auto & layer_stats = collector.stats[layer];
-        if (layer_stats.empty()) layer_stats.resize(collector.n_expert);
-        for (int64_t token = 0; token < state.n_tokens; ++token) {
-            double sum = 0.0;
-            for (int64_t slot = 0; slot < state.n_used; ++slot) {
-                const size_t index = token * state.n_used + slot;
-                const int32_t expert = state.ids[index];
-                const float probability = state.probabilities[index];
-                if (expert < 0 || expert >= collector.n_expert || !std::isfinite(probability)) {
-                    ++collector.invalid_routing;
-                    continue;
-                }
-                ++layer_stats[expert].selection_count;
-                layer_stats[expert].probability_sum += probability;
-                sum += std::max(0.0f, probability);
-            }
-            if (sum > 0.0) {
-                double entropy = 0.0;
-                for (int64_t slot = 0; slot < state.n_used; ++slot) {
-                    const double p = std::max(0.0f, state.probabilities[token * state.n_used + slot]) / sum;
-                    if (p > 0.0) entropy -= p * std::log(p);
-                }
-                collector.entropy_sum += entropy;
-                ++collector.entropy_tokens;
-            }
-        }
+    if (weight_layer >= 0) {
+        route_layer_state & state = collector.pending[weight_layer];
+        if (!state.pending || ggml_nelements(tensor) != (int64_t) state.ids.size()) return true;
+        const tensor_reader weights(tensor);
+        state.probabilities.resize(state.ids.size());
+        for (size_t i = 0; i < state.probabilities.size(); ++i) state.probabilities[i] = weights.f32(i);
         return true;
     }
 
     const int32_t layer = tensor_layer(name.c_str(), "ffn_moe_down");
     route_layer_state & state = collector.pending[layer];
-    if (state.ids.empty() || state.probabilities.empty() || tensor->ne[1] != state.n_used || tensor->ne[2] != state.n_tokens) return true;
-    const std::vector<uint8_t> data = tensor_bytes(tensor);
+    if (!state.pending || state.probabilities.empty() || tensor->ne[1] != state.n_used || tensor->ne[2] != state.n_tokens) return true;
+    const tensor_reader outputs(tensor);
     auto & layer_stats = collector.stats[layer];
+    if (layer_stats.empty()) layer_stats.resize(collector.n_expert);
     for (int64_t token = 0; token < state.n_tokens; ++token) {
         for (int64_t slot = 0; slot < state.n_used; ++slot) {
             const size_t route_index = token * state.n_used + slot;
@@ -304,7 +380,7 @@ bool route_callback(ggml_tensor * tensor, bool ask, void * user_data) {
             double sum_sq = 0.0;
             const size_t base = (token * state.n_used + slot) * tensor->ne[0];
             for (int64_t i = 0; i < tensor->ne[0]; ++i) {
-                const double value = tensor_float(data, tensor->type, base + i);
+                const double value = outputs.f32(base + i);
                 sum_sq += value * value;
             }
             const double norm = std::sqrt(sum_sq);
@@ -395,6 +471,11 @@ evaluation_result evaluate(
             }
         }
     }
+    route_flush_all(collector);
+    if (collector.disabled_selected > 0) {
+        throw std::runtime_error(std::to_string(collector.disabled_selected) + " selections of soft-pruned experts: the " +
+            "model's MoE graph does not apply the pruning mask (llm_graph_context::build_moe_ffn)");
+    }
     result.elapsed_seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     result.throughput = result.elapsed_seconds == 0.0 ? 0.0 : result.processed_tokens / result.elapsed_seconds;
     result.invalid_routing = collector.invalid_routing;
@@ -467,6 +548,9 @@ common_moe_prune_stats parse_stats(const json & value) {
     return result;
 }
 
+// version 1 caches were written by a collector that misread the expert ids, their statistics are wrong
+constexpr int importance_cache_version = 2;
+
 std::string importance_cache_path(const options & opts) {
     return opts.importance_cache.empty() ? opts.output_dir + "/importance-cache.json" : opts.importance_cache;
 }
@@ -474,7 +558,7 @@ std::string importance_cache_path(const options & opts) {
 json importance_cache_json(const importance_cache_data & cache, llama_prune_ppl_mask primary) {
     return {
         { "format", "llama-moe-prune-importance-cache" },
-        { "version", 1 },
+        { "version", importance_cache_version },
         { "model", {
             { "architecture", cache.model.architecture },
             { "model_hash", cache.model.model_hash },
@@ -511,8 +595,11 @@ importance_cache_data load_importance_cache(const std::string & path) {
     if (!in) throw std::runtime_error("failed to open importance cache: " + path);
     json root;
     in >> root;
-    if (root.value("format", "") != "llama-moe-prune-importance-cache" || root.value("version", 0) != 1) {
+    if (root.value("format", "") != "llama-moe-prune-importance-cache") {
         throw std::runtime_error("unsupported importance cache format: " + path);
+    }
+    if (root.value("version", 0) != importance_cache_version) {
+        throw std::runtime_error("importance cache version " + std::to_string(root.value("version", 0)) + " is outdated, rerun analyze without it: " + path);
     }
     importance_cache_data result;
     const json & model = root.at("model");
@@ -542,40 +629,6 @@ importance_cache_data load_importance_cache(const std::string & path) {
     return result;
 }
 
-std::optional<importance_cache_data> load_legacy_baseline_checkpoint(
-        const std::string & path,
-        const common_moe_prune_model_info & model,
-        const std::string & dataset_hash,
-        const options & opts) {
-    try {
-        std::ifstream in(path);
-        json root;
-        in >> root;
-        if (root.value("format", "") != "llama-moe-prune-baseline-checkpoint" || root.value("version", 0) != 1 ||
-            root.value("model_hash", "") != model.model_hash || root.value("expert_tensor_hash", "") != model.expert_tensor_hash ||
-            root.value("dataset_hash", "") != dataset_hash || root.value("ppl_mask", "") != llama_prune_ppl_mask_name(opts.mask) ||
-            root.value("ctx_size", 0) != opts.n_ctx) return std::nullopt;
-        importance_cache_data result;
-        result.model = model;
-        result.dataset_hash = dataset_hash;
-        result.metric = opts.metric;
-        result.n_ctx = opts.n_ctx;
-        result.baseline.nll = root.at("nll").get<std::array<double, 4>>();
-        result.baseline.evaluated = root.at("evaluated").get<std::array<int64_t, 4>>();
-        result.baseline.total_tokens = root.at("total_tokens").get<int64_t>();
-        result.baseline.processed_tokens = root.at("processed_tokens").get<int64_t>();
-        result.baseline.elapsed_seconds = root.at("elapsed_seconds").get<double>();
-        result.baseline.throughput = root.at("throughput").get<double>();
-        result.baseline.router_load_imbalance = root.at("router_load_imbalance").get<double>();
-        result.baseline.router_entropy = root.at("router_entropy").get<double>();
-        result.baseline.invalid_routing = root.at("invalid_routing").get<uint64_t>();
-        result.stats = parse_stats(root.at("stats"));
-        return result;
-    } catch (const std::exception &) {
-        return std::nullopt;
-    }
-}
-
 void write_json_atomic(const std::string & path, const json & value, const std::string & description) {
     const std::filesystem::path parent = std::filesystem::path(path).parent_path();
     if (!parent.empty()) std::filesystem::create_directories(parent);
@@ -584,7 +637,7 @@ void write_json_atomic(const std::string & path, const json & value, const std::
     if (!out) throw std::runtime_error("failed to write " + description);
     out << value.dump(2) << '\n';
     out.close();
-    if (!out || std::rename(tmp.c_str(), path.c_str()) != 0) {
+    if (!out || !common_moe_prune_replace_file(tmp, path)) {
         std::remove(tmp.c_str());
         throw std::runtime_error("failed to replace " + description);
     }
@@ -677,8 +730,15 @@ void run_analyze(const options & opts) {
     const std::string cache_path = importance_cache_path(opts);
     std::optional<importance_cache_data> cache;
     if (std::filesystem::exists(cache_path)) {
-        importance_cache_data loaded = load_importance_cache(cache_path);
-        const std::string mismatch = importance_cache_mismatch(loaded, model_info, dataset_hash, opts);
+        importance_cache_data loaded;
+        std::string mismatch;
+        try {
+            loaded = load_importance_cache(cache_path);
+            mismatch = importance_cache_mismatch(loaded, model_info, dataset_hash, opts);
+        } catch (const std::exception & e) {
+            if (!opts.importance_cache.empty()) throw;
+            mismatch = e.what();
+        }
         if (mismatch.empty()) {
             cache = std::move(loaded);
             std::cerr << "llama-prune: loaded importance cache " << cache_path << '\n';
@@ -686,12 +746,6 @@ void run_analyze(const options & opts) {
             throw std::runtime_error("importance cache is incompatible: " + mismatch);
         } else {
             std::cerr << "llama-prune: ignoring incompatible automatic importance cache: " << mismatch << '\n';
-        }
-    } else if (opts.importance_cache.empty()) {
-        cache = load_legacy_baseline_checkpoint(opts.output_dir + "/baseline-checkpoint.json", model_info, dataset_hash, opts);
-        if (cache) {
-            write_json_atomic(cache_path, importance_cache_json(*cache, opts.mask), "importance cache");
-            std::cerr << "llama-prune: migrated baseline checkpoint to " << cache_path << '\n';
         }
     }
     if (!cache) {
@@ -778,6 +832,7 @@ void run_analyze(const options & opts) {
         }
         route_collector collector;
         collector.n_expert = model_info.expert_count;
+        route_set_disabled(collector, profile);
         std::cerr << "llama-prune: loading model for ratio " << profile.requested_ratio << '\n';
         loaded_model pruned_model = load_model(opts, &collector, &profile);
         if (dataset.records.empty()) {
@@ -814,7 +869,7 @@ void run_analyze(const options & opts) {
     std::ofstream out(opts.output_dir + "/analysis.json", std::ios::trunc);
     out << analysis.dump(2) << '\n';
     std::ofstream summary(opts.output_dir + "/README.txt", std::ios::trunc);
-    summary << "Gemma 4 26B A4B static MoE pruning analysis\nBaseline perplexity (" << llama_prune_ppl_mask_name(opts.mask) << "): " << baseline.ppl(opts.mask) << "\n";
+    summary << model_info.architecture << " static MoE pruning analysis\nBaseline perplexity (" << llama_prune_ppl_mask_name(opts.mask) << "): " << baseline.ppl(opts.mask) << "\n";
     for (const auto & row : analysis["ratios"]) {
         summary << "ratio " << row["requested_ratio"];
         if (row["evaluated"].get<bool>()) summary << ": ppl " << row["ppl"] << ", delta " << row["absolute_perplexity_delta"];
@@ -838,7 +893,7 @@ void run_hard(const options & opts) {
             }
         }
     } guard { staging_output };
-    const llama_prune_hard_prune_report report = llama_prune_hard_prune_gemma4_q4_0(opts.model, profile, model, staging_output);
+    const llama_prune_hard_prune_report report = llama_prune_hard_prune(opts.model, profile, model, staging_output);
 
     options validation_opts = opts;
     validation_opts.model = staging_output;
@@ -865,6 +920,7 @@ void run_hard(const options & opts) {
     if (hard_evaluation) {
         route_collector soft_collector;
         soft_collector.n_expert = model.expert_count;
+        route_set_disabled(soft_collector, profile);
         loaded_model soft_model = load_model(opts, &soft_collector, &profile);
         common_chat_templates_ptr templates = common_chat_templates_init(soft_model.init->model(), "");
         const llama_prune_dataset dataset = llama_prune_dataset_load(opts.dataset, soft_model.init->model(), templates.get(), opts.dataset_threads);
@@ -881,6 +937,7 @@ void run_hard(const options & opts) {
         std::ifstream report_in(report_path);
         json report_json_value;
         report_in >> report_json_value;
+        report_in.close(); // Windows cannot replace a file that is still open
         report_json_value["validation"] = {
             { "dataset_hash", common_moe_prune_sha256_file(opts.dataset) },
             { "ppl_mask", llama_prune_ppl_mask_name(opts.mask) },
@@ -896,7 +953,7 @@ void run_hard(const options & opts) {
         std::ofstream report_out(tmp_report, std::ios::trunc);
         report_out << report_json_value.dump(2) << '\n';
         report_out.close();
-        if (!report_out || std::rename(tmp_report.c_str(), report_path.c_str()) != 0) {
+        if (!report_out || !common_moe_prune_replace_file(tmp_report, report_path)) {
             std::remove(tmp_report.c_str());
             throw std::runtime_error("failed to update hard-pruning validation report");
         }
@@ -910,13 +967,13 @@ void run_hard(const options & opts) {
                 "); output was not committed, staging files and report are at " + staging_output);
         }
     }
-    if (std::rename(staging_output.c_str(), opts.output.c_str()) != 0) {
+    if (!common_moe_prune_replace_file(staging_output, opts.output)) {
         throw std::runtime_error("failed to atomically replace hard-pruned GGUF output");
     }
     // The model is now safely at its final location: from here on the guard must not delete
     // anything, since staging_output no longer refers to a rollback-able intermediate state.
     guard.committed = true;
-    if (std::rename((staging_output + ".report.json").c_str(), (opts.output + ".report.json").c_str()) != 0) {
+    if (!common_moe_prune_replace_file(staging_output + ".report.json", opts.output + ".report.json")) {
         throw std::runtime_error("hard-pruned model written to " + opts.output +
             ", but failed to move its report; the report remains at " + staging_output + ".report.json");
     }

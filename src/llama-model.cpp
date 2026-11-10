@@ -4022,12 +4022,10 @@ bool llama_model_set_moe_prune(
     if (model == nullptr) {
         return llama_model_moe_prune_error(error, error_size, "model is null");
     }
-    // Mirrors common_moe_prune_is_supported_architecture() (common/moe-prune.h) on the GGUF-metadata
-    // side: LLM_TYPE_26B_A4B encodes the same "gemma4, 30 layers" constraint as
-    // COMMON_MOE_PRUNE_GEMMA4_ARCHITECTURE/COMMON_MOE_PRUNE_GEMMA4_LAYER_COUNT, re-expressed via
-    // arch/type enums because src/ cannot depend on common/. Keep both in sync.
-    if (model->arch != LLM_ARCH_GEMMA4 || model->type != LLM_TYPE_26B_A4B) {
-        return llama_model_moe_prune_error(error, error_size, "unsupported architecture: MoE pruning supports Gemma 4 26B A4B only");
+    // the mask is applied in llm_graph_context::build_moe_ffn; an architecture with its own routing
+    // ignores it, llama-prune detects that by checking that no disabled expert gets selected
+    if (model->hparams.n_expert == 0) {
+        return llama_model_moe_prune_error(error, error_size, "model has no routed experts");
     }
     if (model->hparams.moe_prune_active) {
         return llama_model_moe_prune_error(error, error_size, "MoE pruning profile is already set for this model");

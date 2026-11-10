@@ -1,14 +1,18 @@
 # Static MoE expert pruning
 
-`llama-prune` implements static expert pruning for Gemma 4 26B A4B. The initial hard-pruning implementation supports the Q4_0 QAT GGUF layout loaded by `src/models/gemma4.cpp`. Other architectures and Gemma 4 variants fail with an unsupported-architecture error.
+`llama-prune` implements static expert pruning for MoE models. Gemma 4 26B A4B was the first tested model.
+
+## Supported models
+
+Any GGUF whose routed experts are stacked tensors `blk.N.ffn_*_exps.*` with a router `blk.N.ffn_gate_inp.weight`, and whose metadata has `<arch>.block_count`, `<arch>.expert_count` and `<arch>.expert_used_count`. Tested end to end on Gemma 4 26B A4B (earlier) and qwen3moe (`bayliner1980/Qwen3-0.6B-MoE-A0.5B-GGUF`, Q4_K_M). Dense models fail with "not a MoE model".
 
 > Soft pruning does not modify model weights. It statically disables selected experts when the model is loaded. The selected profile cannot be changed while the server is running.
 
 ## Soft and hard pruning
 
-Soft pruning writes a JSON profile containing original expert IDs. At model initialization, the profile identity hashes and shape constraints are validated. Disabled router logits are set to negative infinity before routing selection. Surviving router probabilities retain the model's original softmax and selected-weight normalization behavior.
+Soft pruning writes a JSON profile containing original expert IDs. At model initialization, the profile identity hashes and shape constraints are validated. Disabled router logits are set to negative infinity before routing selection. Surviving router probabilities retain the model's original softmax and selected-weight normalization behavior. The mask is applied in `llm_graph_context::build_moe_ffn`. During every soft-pruned evaluation `llama-prune` fails if a disabled expert is still selected, which catches an architecture whose MoE graph bypasses the mask.
 
-Hard pruning consumes exactly one soft profile. It creates a new GGUF with compacted routed expert tensors and router rows, updates `gemma4.expert_count`, and records each original-to-new expert mapping. The dense parallel MLP in every Gemma 4 MoE layer is the shared expert path and is always copied without changes.
+Hard pruning consumes exactly one soft profile. It creates a new GGUF with compacted routed expert tensors and router rows, updates `<arch>.expert_count`, and records each original-to-new expert mapping. Shared experts (`*_shexp*`) and any dense parallel MLP are always copied without changes.
 
 Hard pruning never edits the source model. It writes a temporary sibling file, finishes and validates it, then renames it to the requested output.
 
@@ -34,7 +38,7 @@ Field masks use a deterministic token-start rule. A rendered token belongs to th
 
 ```sh
 build/bin/llama-prune analyze \
-  --model gemma-4-26b-a4b-q4_0.gguf \
+  --model model.gguf \
   --dataset calibration.jsonl \
   --ratios 0.05,0.10,0.15,0.20,0.25 \
   --metric router-output \
@@ -44,15 +48,17 @@ build/bin/llama-prune analyze \
   --output-dir pruning-results
 ```
 
-Calibration collects selection count and frequency, router probability sum and mean, routed expert output L2 norm, and `mean(router_probability * output_norm)`. That last quantity is the `router-output` metric and is the REAP saliency score — see [Importance metric](#importance-metric) below. Experts are ranked once per layer by the final metric with original expert ID as the deterministic tie-breaker. Every larger ratio takes a longer prefix of the same ranking, so pruning sets are nested.
+Calibration reads the expert ids from `ffn_moe_topk` (a strided view, read stride-aware) and the gate weight g_j from the last of `ffn_moe_weights`, `ffn_moe_weights_softmax`, `ffn_moe_weights_norm`, `ffn_moe_weights_scaled` that the architecture computes. It collects selection count and frequency, router probability sum and mean, routed expert output L2 norm, and `mean(router_probability * output_norm)`. That last quantity is the `router-output` metric and is the REAP saliency score - see [Importance metric](#importance-metric) below. Experts are ranked once per layer by the final metric with original expert ID as the deterministic tie-breaker. Every larger ratio takes a longer prefix of the same ranking, so pruning sets are nested.
 
 The first calibration writes `pruning-results/importance-cache.json`. The cache contains model and dataset identities, context size, baseline token/NLL aggregates, and the raw per-layer expert statistics. It does not contain a ratio-specific ranking. A later `analyze` command with compatible inputs loads this cache instead of running baseline calibration again. Use `--importance-cache FILE` to share one cache across output directories.
+
+The cache format is version 2. Version 1 caches were produced by a collector that read the strided `ffn_moe_topk` view as contiguous, so they attributed routing to the wrong experts. They are ignored when found automatically and rejected when passed with `--importance-cache`. The old `baseline-checkpoint.json` migration was removed. Profiles written from version 1 caches should be regenerated by re-running `analyze`.
 
 Ratio evaluation is enabled by default. Use `--no-evaluate` to generate profiles without loading and evaluating each soft-pruned model:
 
 ```sh
 build/bin/llama-prune analyze \
-  --model gemma-4-26b-a4b-q4_0.gguf \
+  --model model.gguf \
   --dataset calibration.jsonl \
   --importance-cache calibration-importance.json \
   --ratios 0.05,0.10,0.15,0.20,0.25 \
@@ -87,7 +93,7 @@ JSONL reading, message parsing, template rendering, and tokenization use ordered
 
 ```sh
 build/bin/llama-server \
-  --model gemma-4-26b-a4b-q4_0.gguf \
+  --model model.gguf \
   --moe-prune-profile pruning-results/profile-020.json
 ```
 
@@ -99,18 +105,20 @@ Validation covers format, version, architecture, full model SHA-256, expert iden
 
 ```sh
 build/bin/llama-prune inspect \
-  --model gemma-4-26b-a4b-q4_0.gguf \
+  --model model.gguf \
   --profile pruning-results/profile-020.json
 
 build/bin/llama-prune hard \
-  --model gemma-4-26b-a4b-q4_0.gguf \
+  --model model.gguf \
   --profile pruning-results/profile-020.json \
-  --output gemma-4-26b-a4b-pruned.gguf \
+  --output model-pruned.gguf \
   --dataset calibration.jsonl \
   --validate
 ```
 
-The hard converter accepts routed expert weights only when they are Q4_0 tensors with the original expert axis at GGML dimension 2, dimension 0 divisible by the Q4_0 block size of 32, and a tensor size equal to `row_size(ne0) * ne1 * ne2`. Each surviving expert slice is copied byte-for-byte. Router rows and optional per-expert scales are compacted without dequantization.
+Hard pruning works for any tensor type, quantized or not. For each tensor in a pruned layer that carries one slice per expert (router weight `ffn_gate_inp.weight` and bias `ffn_gate_inp.bias`, expert selection bias `exp_probs_b.*`, and every `*_exps.*` tensor: weights, biases, per-expert scales), the expert axis is the highest dimension that is not 1. It must equal `expert_count`, the experts must be stored contiguously (tensor size == slice size * expert_count), and the surviving slices are copied byte-for-byte. Per-expert vectors (expert axis 0) must not be quantized. All other tensors, including `ffn_gate_inp.scale` and shared experts `*_shexp*`, are copied unchanged. Every pruned layer must contain at least one stacked expert tensor.
+
+Hard pruning rejects grouped expert routing (`<arch>.expert_group_count > 1`, DeepSeek V3 style); use the soft profile for those.
 
 After conversion, the command reopens the output with the normal model loader and runs a short inference smoke test. When `--dataset` is present, it evaluates the hard model and the source model with the static soft profile, then records both perplexities and their absolute difference. The mapping, byte counts, and optional validation results are written to `<output>.report.json`.
 
@@ -122,20 +130,37 @@ After conversion, the command reopens the output with the normal model loader an
 REAP(j) = mean_{t in X_j} [ g_j(t) * ||f_j(t)||_2 ]
 ```
 
-`f_j` is the routed expert output *before* gate weighting (`ffn_moe_down`) and `g_j` is the post-normalization router probability (`ffn_moe_weights_norm`). Calibration also accumulates the ungated mean `||f_j||_2` (the EAN criterion) and the mean router probability, both recorded in the importance cache for comparison but not currently selectable as ranking metrics.
+`f_j` is the routed expert output *before* gate weighting (`ffn_moe_down`) and `g_j` is the router gate weight, read from the last of `ffn_moe_weights`, `ffn_moe_weights_softmax`, `ffn_moe_weights_norm`, `ffn_moe_weights_scaled` that the architecture computes. Calibration also accumulates the ungated mean `||f_j||_2` (the EAN criterion) and the mean router probability, both recorded in the importance cache for comparison but not currently selectable as ranking metrics.
 
 Reference: "REAP: Router-weighted Expert Activation Pruning", [arXiv:2510.13999](https://arxiv.org/abs/2510.13999) — the score above is Equation 9.
 
 ## Provenance
 
-The expert profiling engine — the REAP/EAN accumulators and the ggml eval-callback interception of `ffn_moe_topk`, `ffn_moe_weights_norm`, and `ffn_moe_down` — derives from the `feat/moe-expert-profiling` branch by Salvatore Rossitto (`tools/expert-profile/expert-profile.cpp` and the `tools/moe-pruning` scripts, March 2026), reimplemented in C++ for this tool. GGUF expert compaction follows the approach of that branch's `gguf_prune.py`.
+The expert profiling engine - the REAP/EAN accumulators and the ggml eval-callback interception of `ffn_moe_topk`, the `ffn_moe_weights*` tensors, and `ffn_moe_down` - derives from the `feat/moe-expert-profiling` branch by Salvatore Rossitto (`tools/expert-profile/expert-profile.cpp` and the `tools/moe-pruning` scripts, March 2026), reimplemented in C++ for this tool. GGUF expert compaction follows the approach of that branch's `gguf_prune.py`.
 
 Built on top of that here: the soft-pruning graph mask (`llama_model_set_moe_prune` and `llm_graph_input_moe_mask`, which disable experts at inference time without touching weights), the hashed and validated JSON profile format, the ChatML dataset and per-field perplexity masks, and the reusable importance cache.
 
+## Example results
+
+Measured on Qwen3-0.6B-MoE-A0.5B Q4_K_M (32 experts, top 16, 28 MoE layers), Vulkan, 157-conversation calibration set. These numbers describe that model only, not general guidance.
+
+| Experts pruned | Perplexity | Change |
+| --- | --- | --- |
+| 0% (baseline) | 93.89 | - |
+| 12.5% | 93.92 | +0.03% |
+| 25% | 102.09 | +8.7% |
+| 50% | 133.54 | +42% |
+
+Hard-pruning 25% reduces the file from 416.5 MB to 371.6 MB; hard and soft perplexity agree within 0.2%.
+
+## Tests
+
+`ctest -C Release -L real-model --output-on-failure` downloads the qwen3moe model once into `models/hf-cache/` (CMake cache variable `LLAMA_TEST_MODELS_DIR`), then runs analyze, hard with `--validate`, and inference on the pruned model (`tests/test-moe-prune-model.cmake`). Unit tests: `test-moe-prune`.
+
 ## Limitations
 
-- Hard pruning supports only Gemma 4 26B A4B Q4_0 QAT GGUF.
-- All routed layers must retain the same expert count.
-- Grouped routing, heterogeneous expert counts, interleaved expert storage, packed expert axes, and non-Q4_0 routed expert weights are rejected.
+- All routed layers must retain the same expert count; heterogeneous expert counts per layer are rejected.
+- Grouped expert routing (`<arch>.expert_group_count > 1`) is rejected by hard pruning; use the soft profile.
+- Interleaved or packed expert storage and the old per-expert split tensor layout (`blk.N.ffn_gate.E.weight`) are not supported.
 - Shared-expert pruning is not supported.
 - Automatic benchmark-suite execution is not included.
