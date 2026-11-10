@@ -140,6 +140,9 @@ static graph_result run_graph(
 }
 
 int main() {
+    // with GGML_BACKEND_DL the CPU backend is a plugin that must be loaded first
+    ggml_backend_load_all();
+
     {
         const std::vector<float> losses  = { 1.0f, 2.0f, 4.0f };
         const std::vector<float> weights = { 1.0f, 3.0f, 1.0f };
