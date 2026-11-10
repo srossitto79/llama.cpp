@@ -826,13 +826,15 @@ static ggml_opt_dataset_t build_dataset(
 
     for (int64_t i = 0; i < ndata; ++i) {
         const int64_t off = i * stride;
+        // mean reward of the window's sample tokens, each counted once; padding is left out, otherwise
+        // the padded last window stands out and min-max scaling below zeroes every other window
         float reward_sum = 0.0f;
+        int32_t n_reward = 0;
         for (int32_t j = 0; j < n_ctx; ++j) {
             const int64_t idx = off + j;
             if (idx >= n_tokens) {
                 data  [i * n_ctx + j] = bos_token >= 0 ? bos_token : flat_tokens.back();
                 labels[i * n_ctx + j] = -1;
-                reward_sum += 1.0f;
                 if (critical_enabled) critical_metadata[i * n_ctx + j] = { 0.0f, 0.0f };
                 ++n_padded;
                 continue;
@@ -847,7 +849,6 @@ static ggml_opt_dataset_t build_dataset(
             labels[i * n_ctx + j] = flat_labels[idx];
             if (flat_labels[idx] >= 0) {
                 ++n_labels;
-                reward_sum += flat_rewards[idx];
                 if (critical_enabled) {
                     critical_metadata[i * n_ctx + j] = { flat_span_weights[idx], flat_rewards[idx] };
                 }
@@ -855,8 +856,9 @@ static ggml_opt_dataset_t build_dataset(
                 critical_metadata[i * n_ctx + j] = { 0.0f, 0.0f };
             }
             reward_sum += flat_rewards[idx];
+            ++n_reward;
         }
-        window_rewards[i] = reward_sum / n_ctx;
+        window_rewards[i] = n_reward > 0 ? reward_sum / n_reward : 1.0f;
     }
     LOG_INF("%s: packed %ld tokens into %ld windows (ctx=%d stride=%ld, supervised labels=%ld, padded=%ld)\n",
             __func__, (long)n_tokens, (long)ndata, n_ctx, (long)stride, (long)n_labels, (long)n_padded);
