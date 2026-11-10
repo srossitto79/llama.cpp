@@ -1816,6 +1816,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // repacked CPU weights only support MUL_MAT, the backward pass also copies frozen weights to F32
+    if (!params.no_extra_bufts) {
+        LOG_INF("%s: disabling weight repacking, the backward pass cannot read repacked weights\n", __func__);
+        params.no_extra_bufts = true;
+    }
+
     if (!params.grpo_mode && params.train_file.empty()) {
         LOG_ERR("%s: --train-file is required (or use --grpo-mode for IPC training)\n", __func__);
         return 1;

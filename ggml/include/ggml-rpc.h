@@ -8,10 +8,11 @@ extern "C" {
 
 #define RPC_PROTO_MAJOR_VERSION    8
 #define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    1
+#define RPC_PROTO_PATCH_VERSION    2
 
+// the fork adds GGML_OP_OUT_PROD_ID, so its op numbering differs from upstream: do not mix fork and upstream RPC peers
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16
