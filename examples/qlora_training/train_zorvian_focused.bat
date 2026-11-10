@@ -5,7 +5,7 @@ set ROOT=%~dp0..\..
 pushd "%ROOT%" || exit /b 1
 
 set EXE=build-cuda\bin\llama-finetune-qlora.exe
-set MODEL=examples\qlora_training\Qwen3-1.7B.Q4_K_M.gguf
+set MODEL=models\hf-cache\Qwen3-0.6B-Q4_0.gguf
 if not defined TRAIN_FILE set TRAIN_FILE=examples\qlora_training\zorvian_focus_data.jsonl
 if not defined LORA_OUT set LORA_OUT=examples\qlora_training\zorvian_focus_adapter.gguf
 if not defined EPOCHS set EPOCHS=10

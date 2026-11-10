@@ -5,7 +5,7 @@ set ROOT=%~dp0..\..
 pushd "%ROOT%" || exit /b 1
 
 set CLI=build-cuda\bin\llama-cli.exe
-set MODEL=examples\qlora_training\Qwen3-1.7B.Q4_K_M.gguf
+set MODEL=models\hf-cache\Qwen3-0.6B-Q4_0.gguf
 if not defined LORA set LORA=examples\qlora_training\zorvian_train_adapter.gguf
 if not defined TEST_TEMP set TEST_TEMP=0
 if not defined TEST_TOP_P set TEST_TOP_P=0.9

@@ -14,6 +14,10 @@
 #   QUANT        optional quantization type applied to MODEL first, e.g. q4_0
 #   WORK_DIR     scratch directory, recreated on every run
 #   NGL          comma-separated -ngl values, e.g. 0,99 (0 is the CPU, 99 the default GPU backend)
+#
+# Optional training settings, the defaults suit the generated dummy models:
+#   EPOCHS (3), LR (1e-2), LORA_RANK (4), CTX (64, also the batch and ubatch size),
+#   MAX_BACKEND_LOSS_DIFF (50: largest per-epoch loss difference between backends, in units of 1e-4)
 
 foreach(var FINETUNE COMPLETION EXPORT_LORA MODEL WORK_DIR NGL)
     if (NOT DEFINED ${var})
@@ -25,9 +29,13 @@ if (NOT EXISTS "${MODEL}")
     message(FATAL_ERROR "model not found: ${MODEL} (run test-generate-models first)")
 endif()
 
-set(EPOCHS 3)
-# largest per-epoch loss difference between backends, in units of 1e-4
-set(MAX_BACKEND_LOSS_DIFF 50)
+foreach(setting "EPOCHS;3" "LR;1e-2" "LORA_RANK;4" "CTX;64" "MAX_BACKEND_LOSS_DIFF;50")
+    list(GET setting 0 name)
+    list(GET setting 1 value)
+    if (NOT DEFINED ${name})
+        set(${name} ${value})
+    endif()
+endforeach()
 
 string(REPLACE "," ";" NGL_LIST "${NGL}")
 
@@ -73,7 +81,7 @@ foreach(ngl IN LISTS NGL_LIST)
     set(adapter "${WORK_DIR}/adapter-ngl${ngl}.gguf")
     run_step(finetune-ngl${ngl} "${FINETUNE}"
         -m "${MODEL}" --train-file "${TRAIN_FILE}" --lora-out "${adapter}"
-        --lora-rank 4 -c 64 -b 64 -ub 64 --epochs ${EPOCHS} -lr 1e-2
+        --lora-rank ${LORA_RANK} --lora-alpha ${LORA_RANK} -c ${CTX} -b ${CTX} -ub ${CTX} --epochs ${EPOCHS} -lr ${LR}
         -ngl ${ngl} -t 4 --seed 42)
 
     string(REGEX MATCHALL "epoch [0-9]+/[0-9]+: train_loss=[^ ]+" loss_lines "${STEP_OUTPUT}")
@@ -86,11 +94,12 @@ foreach(ngl IN LISTS NGL_LIST)
     set(losses "")
     foreach(line IN LISTS loss_lines)
         string(REGEX REPLACE ".*train_loss=" "" loss "${line}")
-        if (NOT loss MATCHES "^[0-9]+\\.[0-9][0-9][0-9][0-9]$")
+        if (NOT loss MATCHES "^([0-9]+)\\.([0-9][0-9][0-9][0-9])$")
             message(FATAL_ERROR "ngl=${ngl}: train_loss is not a finite number: ${line}")
         endif()
-        string(REPLACE "." "" loss "${loss}")
-        string(REGEX REPLACE "^0+([0-9])" "\\1" loss "${loss}")
+        # REGEX REPLACE re-applies ^ after every match, so stripping zeros with it corrupts 0.6024;
+        # the leading 1 keeps the fraction digits out of any leading-zero handling
+        math(EXPR loss "${CMAKE_MATCH_1} * 10000 + 1${CMAKE_MATCH_2} - 10000")
         list(APPEND losses "${loss}")
     endforeach()
     message(STATUS "ngl=${ngl}: train_loss x1e4 per epoch: ${losses}")

@@ -351,8 +351,10 @@ target_compile_definitions(test-moe-prune PRIVATE LLAMA_PRUNE_TEST_GEMMA_VOCAB="
 llama_build_and_test(test-moe-backward.cpp)
 
 # QLoRA end to end on the generated dummy models: train, infer with the adapter, merge, infer.
-# tests/ is added before examples/ and tools/, so gate on the options rather than on the targets.
-if (LLAMA_BUILD_EXAMPLES AND LLAMA_BUILD_TOOLS)
+# tests/ is added before examples/ and tools/, so gate on the conditions that build the targets
+# (examples/CMakeLists.txt, tools/CMakeLists.txt: llama-export-lora needs the CPU backend linked in).
+# The OpenVINO backend cannot run training graphs.
+if (LLAMA_BUILD_EXAMPLES AND LLAMA_BUILD_TOOLS AND NOT EMSCRIPTEN AND NOT GGML_BACKEND_DL AND GGML_CPU AND NOT GGML_OPENVINO)
     # model:quantization; each case trains on the CPU (ngl 0) and on the default GPU backend
     # (ngl 99) and requires the same losses, so a CPU-only build compares the CPU with itself
     foreach(qlora_case llama-dense:f32 llama-moe:f32 llama-moe:q4_0 llama-moe:q4_k)
@@ -378,6 +380,58 @@ if (LLAMA_BUILD_EXAMPLES AND LLAMA_BUILD_TOOLS)
             LABELS "main backend"
             FIXTURES_REQUIRED generate-models)
     endforeach()
+
+    # QLoRA and MoE pruning on small real models from Hugging Face (about 850 MB, downloaded once into
+    # LLAMA_TEST_MODELS_DIR). Label real-model only, so CI (-L main) does not download them:
+    #   ctest -C Release -L real-model --output-on-failure
+    set(LLAMA_TEST_MODELS_DIR "${PROJECT_SOURCE_DIR}/models/hf-cache" CACHE PATH "download cache for the real-model tests")
+    # name:repo:revision:file:sha256
+    foreach(real_model
+            qwen3-moe:bayliner1980/Qwen3-0.6B-MoE-A0.5B-GGUF:14a01b7c1b8fc63d5b4f73d424c1a08c49d914c6:Qwen3-0.6B-MoE-A0.5B-Q4_K_M.gguf:4ad1de9e1dc20670fcc02491f4ebe84cfbde41d895d3120da79566b1e2e9afd7
+            qwen3-dense:ggml-org/Qwen3-0.6B-GGUF:13ac06624948e4d8589cb4b6f90100837342fcb8:Qwen3-0.6B-Q4_0.gguf:da2572f16c06133561ce56accaa822216f2391ef4d37fba427801cd6736417d4)
+        string(REPLACE ":" ";" real_model "${real_model}")
+        list(GET real_model 0 rm_name)
+        list(GET real_model 1 rm_repo)
+        list(GET real_model 2 rm_rev)
+        list(GET real_model 3 rm_file)
+        list(GET real_model 4 rm_hash)
+        set(rm_path_${rm_name} "${LLAMA_TEST_MODELS_DIR}/${rm_file}")
+        add_test(NAME test-download-${rm_name} COMMAND ${CMAKE_COMMAND}
+            -DDEST=${rm_path_${rm_name}}
+            -DNAME=${rm_repo}/${rm_file}
+            -DURL=https://huggingface.co/${rm_repo}/resolve/${rm_rev}/${rm_file}
+            -DHASH=SHA256=${rm_hash}
+            -P ${PROJECT_SOURCE_DIR}/cmake/download-models.cmake)
+        set_tests_properties(test-download-${rm_name} PROPERTIES LABELS real-model FIXTURES_SETUP download-${rm_name})
+    endforeach()
+
+    foreach(rm_name qwen3-dense qwen3-moe)
+        add_test(NAME test-qlora-finetune-real-${rm_name}
+            COMMAND ${CMAKE_COMMAND}
+                -DFINETUNE=$<TARGET_FILE:llama-finetune-qlora>
+                -DCOMPLETION=$<TARGET_FILE:llama-completion>
+                -DEXPORT_LORA=$<TARGET_FILE:llama-export-lora>
+                -DMODEL=${rm_path_${rm_name}}
+                -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/test-qlora-finetune-real-${rm_name}
+                -DNGL=0,99
+                -DEPOCHS=4 -DLR=1e-4 -DLORA_RANK=16 -DCTX=128 -DMAX_BACKEND_LOSS_DIFF=200
+                -P ${CMAKE_CURRENT_SOURCE_DIR}/test-qlora-finetune.cmake)
+        set_tests_properties(test-qlora-finetune-real-${rm_name} PROPERTIES
+            LABELS real-model
+            FIXTURES_REQUIRED download-${rm_name})
+    endforeach()
+
+    add_test(NAME test-moe-prune-real-qwen3-moe
+        COMMAND ${CMAKE_COMMAND}
+            -DPRUNE=$<TARGET_FILE:llama-prune>
+            -DCOMPLETION=$<TARGET_FILE:llama-completion>
+            -DMODEL=${rm_path_qwen3-moe}
+            -DWORK_DIR=${CMAKE_CURRENT_BINARY_DIR}/test-moe-prune-real-qwen3-moe
+            -DNGL=99
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/test-moe-prune-model.cmake)
+    set_tests_properties(test-moe-prune-real-qwen3-moe PROPERTIES
+        LABELS real-model
+        FIXTURES_REQUIRED download-qwen3-moe)
 endif()
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
